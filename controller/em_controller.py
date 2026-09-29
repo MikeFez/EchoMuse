@@ -5198,7 +5198,7 @@ async def handle_data(ws: WebSocketServerProtocol, secure: bool = False):
                     if device.wake_clip_capture or device.wake_capture.active is not None:
                         completed = device.wake_capture.feed_audio(pcm)
                         if completed is not None:
-                            asyncio.create_task(_persist_wake_candidate(device, completed)) \
+                            em_tasks.spawn(_persist_wake_candidate(device, completed)) \
                                 .add_done_callback(_log_task_exception)
                     for chunk in device.listen_router.frame(
                             session, pcm, asyncio.get_event_loop().time()):
@@ -5233,7 +5233,7 @@ async def handle_data(ws: WebSocketServerProtocol, secure: bool = False):
                 if device.wake_clip_capture or device.wake_capture.active is not None:
                     completed = device.wake_capture.feed_audio(pcm)
                     if completed is not None:
-                        asyncio.create_task(_persist_wake_candidate(device, completed)) \
+                        em_tasks.spawn(_persist_wake_candidate(device, completed)) \
                             .add_done_callback(_log_task_exception)
                 payload = em_listen.Frame(
                     pcm, _now,

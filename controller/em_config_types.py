@@ -75,6 +75,8 @@ KINDS: dict[str, str] = {
     "owwSpeexNs": BOOL,
     "nsAsr": BOOL,
     "saveUtterances": BOOL,
+    "wakeClipCapture": BOOL,
+    "wakeClipMinScore": FLOAT,
 }
 
 
