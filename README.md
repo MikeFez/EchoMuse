@@ -124,21 +124,25 @@ The wizard offers two ways to run EchoMuse on the Dot:
 
 ## Privacy
 
-- **Nothing leaves your network because of EchoMuse.** The Dot streams its
-  microphone to the controller on your LAN, which listens for the wake word.
-  Only after the wake word is audio passed to Home Assistant, and where it
-  goes from there depends on your Assist pipeline (fully local with Whisper
-  and Piper, or a cloud service if you chose one).
+- **The Echo listens for its wake word itself.** Nothing leaves it until it
+  hears the wake word. Then what you say goes to the controller on your LAN
+  and on to Home Assistant, and stops when you stop speaking. Where it goes
+  after that depends on your Assist pipeline (fully local with Whisper and
+  Piper, or a cloud service if you chose one). A false wake sends a few
+  seconds of audio you didn't mean to; that is true of every wake word
+  system, Amazon's included. [How it works](docs/listening.md).
+- **You can detect the wake word on the controller instead**, per Echo. That
+  Echo then streams its microphone to the controller all the time, on your
+  LAN and nowhere else, and the dashboard says so. Installs from before this
+  keep their existing setting until you change it (Config → Wake word
+  detection). Firmware that predates it streams in every mode and is labelled
+  that way until you update it.
 - **No telemetry.** No analytics, no install counter. The controller only
   connects out to GitHub, to check for and download releases, and you can set
   how often it checks ([details](docs/configuration.md#what-leaves-your-network)).
 - **The mute button is a software mute.** It silences the microphones in the
   audio chip and EchoMuse refuses to listen while it is on, but the Dot 2 has
   no hardware switch that disconnects them.
-- **Even with wake word on the Dot, the microphone still streams to the
-  controller**, which keeps listening for comparison and for barge-in.
-  Keeping all audio on the Dot until it hears the wake word is the next step
-  ([#207](https://github.com/wilbowes/EchoMuse/issues/207)).
 
 ## Status and known issues
 

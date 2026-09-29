@@ -14,6 +14,7 @@ class FakeDevice:
         self.limiter_enabled = True
         self.limiter_threshold = -1.0
         self.limiter_release = 150.0
+        self.output_chain_on_device = False
         self.data_frames: list[bytes] = []
         self.control_msgs: list[dict] = []
 
@@ -1289,3 +1290,73 @@ def test_start_feed_without_a_url_does_not_start_a_task():
     s = asyncio.run(main())
     assert s.spawn_urls == []
     assert s.state != PLAYING
+
+
+def test_a_music_assistant_flow_is_known_unseekable_up_front():
+    """
+    Resuming a flow by seeking waited out SEEK_STALL_S of silence before
+    rejoining the live edge: 7.2s from "resume the music" to sound, measured
+    2026-09-27. The URL says what it is, so the answer is known at play().
+    """
+    flow = ("http://10.10.1.81:8097/flow/2gNgkp6Q/media_player.dev_test_1/"
+            "f7c6af51508f43bdbec08d4b1e1ff139/media_player.dev_test_1.wav")
+    assert em_player.known_unseekable(flow)
+    for url in ("http://ma/track/def.flac", "http://radio/stream",
+                "http://host/flow/abc", "http://host/a/flow/b/c/d/e.wav",
+                "not a url", ""):
+        assert not em_player.known_unseekable(url), url
+
+    async def main():
+        device = FakeDevice()
+        _wire(device)
+        s = StubSession("office", periods=2, endless=True)
+        em_player._sessions["office"] = s
+        await s.play(flow)
+        await asyncio.sleep(0.02)
+        s._pos = 12.6
+        await s.pause()
+        await s.resume()
+        await asyncio.sleep(0.05)
+        assert s.spawns[-1] == 0.0, "a flow must resume at the live edge, not seek"
+        await s.stop()
+    asyncio.run(main())
+
+
+def test_a_slow_read_while_well_ahead_is_not_a_stall(caplog):
+    """
+    Music Assistant paces a flow at 1.03x after a 3s burst, so every read
+    waits ~1s while the feed is still seconds ahead. That is a source keeping
+    pace; warning on it logged ~60 false stalls a minute (2026-09-27).
+    """
+    import logging
+
+    async def main():
+        device = FakeDevice()
+        _wire(device)
+
+        class PacedSession(StubSession):
+            async def _spawn_decoder(self, url, position_s):
+                proc = await super()._spawn_decoder(url, position_s)
+                real_read = proc.stdout.readexactly
+                calls = {"n": 0}
+
+                async def paced(n):
+                    calls["n"] += 1
+                    if calls["n"] == 40:          # slow, but ~1.7s ahead
+                        await asyncio.sleep(0.3)
+                    return await real_read(n)
+                proc.stdout.readexactly = paced
+                return proc
+
+        s = PacedSession("office", periods=42)
+        em_player._sessions["office"] = s
+        em_player.SOURCE_STALL_MS = 200.0
+
+        with caplog.at_level(logging.WARNING, logger="player"):
+            await s.play("http://radio/stream")
+            await asyncio.sleep(0.6)
+
+        assert not any("SOURCE stall" in r.message for r in caplog.records), \
+            "a read that leaves the feed ahead of real time is not a stall"
+    asyncio.run(main())
+    em_player.SOURCE_STALL_MS = 500.0

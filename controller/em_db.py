@@ -39,16 +39,22 @@ log = logging.getLogger("echomuse.db")
 # ─── Default device config ────────────────────────────────────────────────────
 
 DEFAULT_DEVICE_CONFIG = {
-    # owwOnDevice: on-device wake word scoring. "off" or "shadow".
-    # Shadow scores the wake stream on the device and reports what it WOULD
-    # have detected, without acting on it, so the two can be compared on the
-    # same audio. Default off and it should stay that way: it costs ~38% of one
-    # core permanently on top of the ~18-20% mic-pipeline baseline, and it
-    # needs ONNX Runtime plus the models installed on the device out of band
-    # (they are not in the firmware). Enable on ONE device at a time.
-    "owwOnDevice":      "off",
-    # Wake training samples are opt-in; when enabled, score candidates and
-    # actual triggers are saved by the controller for admin review.
+    # owwOnDevice: where the wake word is detected (docs/listening.md).
+    # "on" — on the Echo, which sends nothing until it hears it; "off" — on
+    # the controller, from a continuous stream; "shadow" — both, a streaming
+    # diagnostic. "on" is the default for NEW installs since 2026-09-21: it
+    # costs the Echo ~0.4 of a core, and privacy is what the project stands
+    # on. Existing installs keep what they had — _fixup_v25 pins "off" into a
+    # fleet config that never stored the key, because defaults are layered
+    # UNDER stored config and changing this line alone would silently switch
+    # every existing fleet.
+    "owwOnDevice":      "on",
+    # wakeSound: a rising two-tone on the wake word (#120). Off by default,
+    # since it interrupts "<wakeword>, do this"; an accessibility option
+    # first, because the ring is the only other sign the Echo is listening.
+    "wakeSound":        False,
+    "wakeSoundLevel":   "medium",   # quiet / medium / loud, played by the Echo
+    # Wake training samples are opt-in; candidates and triggers are saved for admin review.
     "wakeClipCapture":  False,
     "wakeClipMinScore": 0.20,
     "adcDigitalGain":   88,
@@ -173,6 +179,13 @@ DEFAULT_DEVICE_CONFIG = {
     # cannot perform. A taste parameter — it wants tuning by ear in a real
     # room, like the LED meter curve, not a firmware push per attempt.
     "duckDb": -18.0,
+    # streamReply: start speaking when Home Assistant says the reply's first
+    # text has arrived (its tts_start_streaming signal) instead of when the whole
+    # reply is done. Default OFF: it is faster when the model and the TTS engine
+    # are quicker than speech, and pauses between sentences when either is
+    # slower, which the controller cannot tell in advance. See em_earlytts.
+    # Controller-side only, read per turn; the device ignores the key.
+    "streamReply":      False,
     "owwModel":         "hey_jarvis_v0.1",
     # Multi-device wake SUPPRESSION window (ms), not a wait. The first
     # device to detect answers immediately; any other device detecting
@@ -313,6 +326,11 @@ DEFAULT_DEVICE_CONFIG = {
     #
     # emOS only, like the password beside it.
     "consoleTimeoutMin": 0,
+    # controllerEndpoints: addresses an Echo dials before mDNS, in order —
+    # [{host, port, tlsPort}]. Fleet-only (em_config_sections.FLEET_KEYS);
+    # delivered as a file, not by the config push (em_endpoints). Empty =
+    # mDNS alone, which is how every fleet worked before it.
+    "controllerEndpoints": [],
 }
 
 # The highest wake threshold that can ever fire, enforced on every config
@@ -532,7 +550,7 @@ MIGRATIONS: list[str] = [
     # token: shared secret the device presents in the X-EM-Token header on
     # all three WebSocket planes (/control, /data, /shell). Minted by
     # ensure_device_token() when credentials are first pushed (provisioning
-    # wizard or the dashboard "Secure link" action) and stored on the device
+    # wizard, or an approval: em_pairing) and stored on the device
     # at /data/local/etc/echomuse/token. NULL = no credentials issued yet —
     # such devices connect unauthenticated (legacy posture) until
     # REQUIRE_DEVICE_TLS=1 flips the controller to enforcing.
@@ -981,7 +999,48 @@ MIGRATIONS: list[str] = [
     """
     UPDATE system_config SET value = '24' WHERE key = 'schema_version';
     """,
-    # ── v25 — labelled wake-word training clips ─────────────────────────────
+
+    # ── v25 — keep existing fleets' wake word mode through the new default ──
+    #
+    # owwOnDevice's default moved "off" → "on" (private listening,
+    # docs/listening.md). Defaults are layered under stored fleet config, so
+    # a fleet that never saved the key would flip on upgrade. Wil's call:
+    # existing deployments keep their configuration, and the release notes
+    # tell them how to switch. The work is in _fixup_v25.
+    """
+    UPDATE system_config SET value = '25' WHERE key = 'schema_version';
+    """,
+
+    # ── v26 — link loss from the kernel's TCP counters ──────────────────────
+    #
+    # The BLE scan made the AP resend 47-150% of frames to a Dot for months
+    # and nothing here could see it (2026-09-23): the MTK RF counters are
+    # structurally zero and RTT shows only the symptom. TCP counts its own
+    # retransmits. Down = the controller's sockets to the device (segments +
+    # retransmits, so a rate); up = the device's own retransmits (a count;
+    # segments only where its kernel reports them). All NULLABLE: an hour
+    # nothing measured must not read as a clean link.
+    """
+    ALTER TABLE device_metrics ADD COLUMN tcp_down_segs_sum    INTEGER;
+    ALTER TABLE device_metrics ADD COLUMN tcp_down_retrans_sum INTEGER;
+    ALTER TABLE device_metrics ADD COLUMN tcp_up_segs_sum      INTEGER;
+    ALTER TABLE device_metrics ADD COLUMN tcp_up_retrans_sum   INTEGER;
+    ALTER TABLE device_metrics ADD COLUMN tcp_rto_max_ms       INTEGER;
+
+    UPDATE system_config SET value = '26' WHERE key = 'schema_version';
+    """,
+    # v27 — when the device first presented its current link token. Set once,
+    # at a register whose X-EM-Token matched; from then a connection claiming
+    # this device without the token is refused (em_linkauth rule 2). NULL means
+    # never presented, which keeps the rollout rule: a row minted before the
+    # credential files reach the device must not lock it out. Cleared whenever
+    # the token changes, so it always describes the CURRENT token.
+    """
+    ALTER TABLE devices ADD COLUMN token_confirmed_at INTEGER;
+
+    UPDATE system_config SET value = '27' WHERE key = 'schema_version';
+    """,
+    # ── v28 — labelled wake-word training clips ─────────────────────────────
     """
     CREATE TABLE IF NOT EXISTS wake_samples (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1000,7 +1059,7 @@ MIGRATIONS: list[str] = [
     CREATE INDEX IF NOT EXISTS idx_wake_samples_device_ts
         ON wake_samples(device_id, ts DESC);
 
-    UPDATE system_config SET value = '25' WHERE key = 'schema_version';
+    UPDATE system_config SET value = '28' WHERE key = 'schema_version';
     """,
 ]
 
@@ -1097,7 +1156,34 @@ def _fixup_v24(conn) -> None:
                 (json.dumps(fixed),))
 
 
-_MIGRATION_FIXUPS = {11: _fixup_v11, 19: _fixup_v19, 24: _fixup_v24}
+def _fixup_v25(conn) -> None:
+    """
+    Pin owwOnDevice="off" into a stored fleet config that lacks it.
+
+    A fresh database already carries the key — v3 seeds the whole of
+    DEFAULT_DEVICE_CONFIG — so this touches only fleets that predate it,
+    which is exactly the set whose behaviour the new default would change.
+    Device rows need nothing: a key a device does not store falls through to
+    the fleet's. A config that will not parse is left alone.
+    """
+    row = conn.execute(
+        "SELECT value FROM system_config WHERE key = 'global_device_config'").fetchone()
+    if not row:
+        return
+    try:
+        cfg = json.loads(row["value"] or "{}") or {}
+    except (json.JSONDecodeError, TypeError):
+        return
+    if "owwOnDevice" in cfg:
+        return
+    cfg["owwOnDevice"] = "off"
+    conn.execute(
+        "UPDATE system_config SET value = ? WHERE key = 'global_device_config'",
+        (json.dumps(cfg),))
+
+
+_MIGRATION_FIXUPS = {11: _fixup_v11, 19: _fixup_v19, 24: _fixup_v24,
+                     25: _fixup_v25}
 
 # ─── Connection management ────────────────────────────────────────────────────
 
@@ -1375,7 +1461,8 @@ def get_all_devices() -> list[sqlite3.Row]:
 def get_pending_devices() -> list[sqlite3.Row]:
     """Return devices that have connected but not yet been approved."""
     return _q(
-        "SELECT * FROM devices WHERE approved = 0 ORDER BY first_seen ASC"
+        "SELECT * FROM devices WHERE approved = 0 AND last_seen IS NOT NULL "
+        "ORDER BY first_seen ASC"
     )
 
 
@@ -1441,18 +1528,21 @@ def upsert_device_seen(
     """
     Update ip, firmware_ver, and last_seen for a known device on each connection.
 
-    Does not touch approval status, label, or config.
+    Does not touch approval status, label, or config. Sets first_seen on the
+    first connection of a row the provisioning wizard created (#453).
     """
+    now = _now()
     with _tx() as conn:
         conn.execute(
             """
             UPDATE devices
             SET ip           = ?,
                 firmware_ver = ?,
+                first_seen   = COALESCE(first_seen, ?),
                 last_seen    = ?
             WHERE device_id = ?
             """,
-            (ip, version, _now(), device_id),
+            (ip, version, now, now, device_id),
         )
 
 
@@ -1485,6 +1575,32 @@ def get_device_token(device_id: str) -> Optional[str]:
     return row["token"] if row and row["token"] else None
 
 
+def get_device_link_auth(device_id: str) -> tuple[Optional[str], bool]:
+    """(token or None, whether the device has presented that token)."""
+    row = _q1("SELECT token, token_confirmed_at FROM devices WHERE device_id = ?",
+              (device_id,))
+    if not row or not row["token"]:
+        return None, False
+    return row["token"], row["token_confirmed_at"] is not None
+
+
+def confirm_device_token(device_id: str, token: str) -> bool:
+    """
+    Record that the device presented `token`, if it is still the stored one
+    and nothing was recorded yet. True when this call recorded it.
+
+    Conditional on the token so a presentation checked against a token that
+    has since been replaced cannot confirm the replacement.
+    """
+    with _tx() as conn:
+        cur = conn.execute(
+            "UPDATE devices SET token_confirmed_at = ? "
+            "WHERE device_id = ? AND token = ? AND token_confirmed_at IS NULL",
+            (_now(), device_id, token),
+        )
+        return cur.rowcount == 1
+
+
 def ensure_device_token(device_id: str) -> str:
     """
     Return the device's link-auth token, minting one if absent.
@@ -1500,30 +1616,43 @@ def ensure_device_token(device_id: str) -> str:
         return existing
 
     token = secrets.token_urlsafe(32)
-    now = _now()
     with _tx() as conn:
+        # first_seen/last_seen stay NULL: this device has never connected,
+        # and NULL is what tells a row the wizard made from one awaiting
+        # approval (#453). upsert_device_seen fills them on first contact.
         conn.execute(
             """
             INSERT INTO devices
                 (device_id, label, approved, ip, firmware_ver, first_seen, last_seen, config)
-            VALUES (?, NULL, 0, NULL, NULL, ?, ?, ?)
+            VALUES (?, NULL, 0, NULL, NULL, NULL, NULL, ?)
             ON CONFLICT(device_id) DO NOTHING
             """,
-            (device_id, now, now, json.dumps(DEFAULT_DEVICE_CONFIG)),
+            (device_id, json.dumps(DEFAULT_DEVICE_CONFIG)),
         )
         conn.execute(
-            "UPDATE devices SET token = ? WHERE device_id = ?",
+            "UPDATE devices SET token = ?, token_confirmed_at = NULL WHERE device_id = ?",
             (token, device_id),
         )
     log.info(f"[db] Link token minted for {device_id}")
     return token
 
 
+def set_device_token(device_id: str, token: str) -> None:
+    """Store a token already delivered to the device; it starts unconfirmed."""
+    with _tx() as conn:
+        conn.execute(
+            "UPDATE devices SET token = ?, token_confirmed_at = NULL WHERE device_id = ?",
+            (token, device_id),
+        )
+    log.info(f"[db] Link token replaced for {device_id}")
+
+
 def clear_device_token(device_id: str) -> None:
     """Revoke a device's link token (next credential push mints a new one)."""
     with _tx() as conn:
         conn.execute(
-            "UPDATE devices SET token = NULL WHERE device_id = ?", (device_id,)
+            "UPDATE devices SET token = NULL, token_confirmed_at = NULL WHERE device_id = ?",
+            (device_id,)
         )
 
 
@@ -2466,6 +2595,18 @@ def record_device_stats(device_id: str, stats: dict) -> None:
     _ble       = stats.get("ble") or {}
     ble_restarts = _ble.get("restarts")
     ble_hci_err  = _ble.get("hciErrors")
+
+    # TCP link loss (v26). Down is controller-measured (Device.drain_tcp),
+    # up is relayed from the device. Every one may be absent, and absent is
+    # NULL: a window nothing measured is not a clean link.
+    def _opt_int(key):
+        v = stats.get(key)
+        return int(v) if v is not None else None
+    tcp_down_segs    = _opt_int("tcpDownSegs")
+    tcp_down_retrans = _opt_int("tcpDownRetrans")
+    tcp_up_segs      = _opt_int("tcpUpSegs")
+    tcp_up_retrans   = _opt_int("tcpUpRetrans")
+    tcp_rto_max      = _opt_int("tcpRtoMaxMs")
     with _tx() as conn:
         conn.execute(
             """
@@ -2481,12 +2622,15 @@ def record_device_stats(device_id: str, stats: dict) -> None:
                 cpu_temp_sum, cpu_temp_samples, cpu_temp_max, max_temp_max,
                 cores_online_last, cores_online_min, cores_total,
                 thermal_limit_min,
-                ble_restarts_last, ble_hci_errors_last
+                ble_restarts_last, ble_hci_errors_last,
+                tcp_down_segs_sum, tcp_down_retrans_sum,
+                tcp_up_segs_sum, tcp_up_retrans_sum, tcp_rto_max_ms
             ) VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                       ?, ?, ?, ?, ?, ?, ?, ?, ?,
                       ?, ?, ?, ?, ?, ?, ?,
                       ?, ?, ?, ?, ?, ?, ?, ?,
-                      ?, ?)
+                      ?, ?,
+                      ?, ?, ?, ?, ?)
             ON CONFLICT (device_id, hour_ts) DO UPDATE SET
                 samples          = samples + 1,
                 cpu_sum          = cpu_sum + excluded.cpu_sum,
@@ -2565,7 +2709,24 @@ def record_device_stats(device_id: str, stats: dict) -> None:
                 ble_restarts_last   = COALESCE(excluded.ble_restarts_last,
                                                ble_restarts_last),
                 ble_hci_errors_last = COALESCE(excluded.ble_hci_errors_last,
-                                               ble_hci_errors_last)
+                                               ble_hci_errors_last),
+                -- TCP loss sums treat NULL as "not measured": a NULL window
+                -- leaves the sum alone, and the first measured one starts it.
+                tcp_down_segs_sum    = CASE WHEN excluded.tcp_down_segs_sum IS NULL
+                    THEN tcp_down_segs_sum
+                    ELSE COALESCE(tcp_down_segs_sum, 0) + excluded.tcp_down_segs_sum END,
+                tcp_down_retrans_sum = CASE WHEN excluded.tcp_down_retrans_sum IS NULL
+                    THEN tcp_down_retrans_sum
+                    ELSE COALESCE(tcp_down_retrans_sum, 0) + excluded.tcp_down_retrans_sum END,
+                tcp_up_segs_sum      = CASE WHEN excluded.tcp_up_segs_sum IS NULL
+                    THEN tcp_up_segs_sum
+                    ELSE COALESCE(tcp_up_segs_sum, 0) + excluded.tcp_up_segs_sum END,
+                tcp_up_retrans_sum   = CASE WHEN excluded.tcp_up_retrans_sum IS NULL
+                    THEN tcp_up_retrans_sum
+                    ELSE COALESCE(tcp_up_retrans_sum, 0) + excluded.tcp_up_retrans_sum END,
+                tcp_rto_max_ms       = CASE WHEN excluded.tcp_rto_max_ms IS NULL
+                    THEN tcp_rto_max_ms
+                    ELSE MAX(COALESCE(tcp_rto_max_ms, 0), excluded.tcp_rto_max_ms) END
             """,
             (
                 device_id, hour_ts,
@@ -2608,6 +2769,8 @@ def record_device_stats(device_id: str, stats: dict) -> None:
                 # be wrong here in a way it is not for the gauges above.
                 int(ble_restarts) if ble_restarts is not None else None,
                 int(ble_hci_err) if ble_hci_err is not None else None,
+                tcp_down_segs, tcp_down_retrans,
+                tcp_up_segs, tcp_up_retrans, tcp_rto_max,
             ),
         )
         conn.execute(
@@ -2690,6 +2853,20 @@ def get_device_metrics(device_id: str, since: float) -> list[dict]:
                 round(100.0 * (r["rtt_excursions"] - r["rtt_excursions_idle"])
                       / (r["rtt_samples"] - r["rtt_samples_idle"]), 1)
                 if (r["rtt_samples"] - r["rtt_samples_idle"]) else None),
+            # TCP link loss (v26) — the CAUSE the RTT excursions are a symptom
+            # of. Down is a rate (the controller counts its segments); up is a
+            # count unless the device's kernel reports segments. None means
+            # not measured, never a clean link.
+            "tcp_down_segs":        r["tcp_down_segs_sum"],
+            "tcp_down_retrans":     r["tcp_down_retrans_sum"],
+            "tcp_down_retrans_pct": (
+                round(100.0 * r["tcp_down_retrans_sum"] / r["tcp_down_segs_sum"], 2)
+                if r["tcp_down_segs_sum"] else None),
+            "tcp_up_retrans":       r["tcp_up_retrans_sum"],
+            "tcp_up_retrans_pct": (
+                round(100.0 * r["tcp_up_retrans_sum"] / r["tcp_up_segs_sum"], 2)
+                if r["tcp_up_segs_sum"] and r["tcp_up_retrans_sum"] is not None else None),
+            "tcp_rto_max_ms":       r["tcp_rto_max_ms"],
         })
     return out
 
@@ -2777,9 +2954,15 @@ def set_user_role(user_id: int, role: str) -> None:
         conn.execute("UPDATE users SET role = ? WHERE id = ?", (role, user_id))
 
 
-def update_user_password(user_id: int, new_hash: str) -> None:
+def update_user_password(user_id: int, new_hash: str, *,
+                         keep_session: Optional[str]) -> int:
     """
-    Update the password hash for a user.
+    Update the password hash for a user and end their other sessions.
+
+    A password change is how someone locks out a session they did not start,
+    so every session but `keep_session` (the one making the change) is
+    deleted in the same transaction. Required rather than defaulted so a new
+    caller has to say which session survives. Returns the number revoked.
 
     new_hash must already be bcrypt-hashed — this function does not hash
     passwords itself. Raises ValueError if the user is not found.
@@ -2791,7 +2974,13 @@ def update_user_password(user_id: int, new_hash: str) -> None:
         )
         if cur.rowcount == 0:
             raise ValueError(f"User not found: {user_id}")
-    log.info(f"[db] Password updated for user id={user_id}")
+        revoked = conn.execute(
+            "DELETE FROM sessions WHERE user_id = ? AND token IS NOT ?",
+            (user_id, keep_session),
+        ).rowcount
+    log.info(f"[db] Password updated for user id={user_id}, "
+             f"{revoked} other session(s) ended")
+    return revoked
 
 
 def get_all_users() -> list[sqlite3.Row]:

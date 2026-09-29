@@ -177,6 +177,59 @@ def test_transcript_bearing_log_lines_are_dropped_whole():
         "turn traces quote transcripts verbatim and must not be sanitised in place"
 
 
+def test_announce_request_lines_survive_with_the_text_redacted():
+    """
+    The AnnounceRequest line is the only record that an announcement arrived
+    and the only place `start_conversation` is logged, so dropping it hides
+    the difference between a plain announce and `ask_question`. Its `text=`
+    is a TTS string HA sent us, quoted by repr, so the quoted-string rule
+    already covers it: keep the line, lose the payload. Reported in #507
+    after a bundle showed announcement audio playing with no announcement
+    ever received, which is not a state the code can reach.
+    """
+    out = "\n".join(S.sanitise_log([
+        "[Kitchen] AnnounceRequest: media_id='http://10.10.1.81:8123/api/tts_proxy/a.mp3' "
+        "text='Dinner is ready' start_conversation=True",
+        # The turn trace is the transcript-bearing line the marker existed
+        # for; it must still go whole, apostrophes and all.
+        "[TURN] trigger=wakeword outcome=ok text=\"what's the weather\" tts_bytes=1",
+    ]))
+    assert "AnnounceRequest" in out
+    assert "start_conversation=True" in out
+    assert "media_id=<redacted>" in out
+    assert "text=<redacted>" in out
+    assert "Dinner" not in out and "ready" not in out
+    assert "[TURN]" not in out and "weather" not in out
+
+
+def test_announce_text_with_mixed_quotes_redacts_whole():
+    """
+    Announcement text is written by the user in their automations, so a
+    partial redaction is a leak. repr escapes an inner quote of the same
+    kind, and the quoted-string rule has to honour that escape instead of
+    ending the match at it.
+    """
+    line = (
+        "[Kitchen] AnnounceRequest: text=" + repr("it's \"late\"")
+        + " start_conversation=False"
+    )
+    out = "\n".join(S.sanitise_log([line]))
+    assert out.split("text=")[1] == "<redacted> start_conversation=False"
+
+
+def test_spoken_dismissal_lines_are_dropped():
+    """
+    The spoken-dismissal line logs the STT transcript by repr. Transcript
+    lines go whole, not redacted, like the other speech markers.
+    """
+    out = "\n".join(S.sanitise_log([
+        "[Kitchen] Spoken dismissal 'stop the alarm' — stopping alarm locally",
+        "[Kitchen] Device connected: ABC v=v2.9.13",
+    ]))
+    assert "Spoken dismissal" not in out and "stop" not in out
+    assert "Device connected" in out
+
+
 def test_live_stats_are_allowlisted_not_passed_through():
     """
     Regression: live.stats was handed over as a whole dict and leaked
@@ -724,3 +777,26 @@ def test_home_assistant_display_names_are_redacted():
     assert "Wil Bowes" not in joined
     assert "wil" not in joined.replace("<admin>", "")
     assert joined.count("<admin>") == 2
+
+
+def test_devices_carry_their_userspace_and_kernel():
+    """#621: stored since schema v21/v23, but missing from the allowlist, so
+    #566's bundle could not say which kernel the device booted. A device that
+    never reported them (old firmware) simply has no such key."""
+    reported = Row({
+        "device_id": "G090LF1180130NJG", "approved": 1,
+        "base_os": "emos", "kernel_arch": "armv7l",
+        "kernel_release": "3.18.19-gecb8cb46060-dirty",
+    })
+    old = Row({"device_id": "G090LF1180440EFF", "approved": 1})
+    bundle = S.build(
+        controller_version="v2.24.1", devices=[reported, old],
+        fleet_config={}, schema_version=26, turns=[], metrics=[], counters=[],
+        device_configs={}, live_state={}, controller_log=[], device_log=[],
+    )
+    first, second = bundle["devices"]
+    assert first["base_os"] == "emos"
+    assert first["kernel_arch"] == "armv7l"
+    assert first["kernel_release"] == "3.18.19-gecb8cb46060-dirty"
+    for key in ("base_os", "kernel_arch", "kernel_release"):
+        assert key not in second

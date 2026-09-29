@@ -96,6 +96,28 @@ little speaker is boomy and dull by default.
 An extra presence bump for spoken responses. Try it if responses sound
 muffled from across the room.
 
+### Speak while the reply is written
+Off by default. When it is off, the Dot starts speaking once Home Assistant
+has the whole reply. When it is on, it starts as soon as Home Assistant has the
+first sentence, so a long reply begins sooner. The gain is the time between the
+first words and the last, less about a second for the first sentence to be
+synthesised, and a short reply gains little.
+
+Home Assistant only offers this when both the conversation agent and the
+text-to-speech engine can stream. If either cannot, the setting has no effect
+and the reply plays when it is complete, as before.
+
+**The catch is speed.** Speech reaches the speaker no faster than it is
+produced. A model that writes more slowly than the reply is spoken (very
+roughly under four tokens a second), or a text-to-speech engine slower than
+realtime, leaves the Dot with nothing to play between sentences. It waits in
+silence and carries on when the next part arrives, so the reply is not lost, but
+it pauses. Try it with a few long replies. If they come out in fits and starts,
+turn it off.
+
+With it on, the 30 seconds the controller waits for a reply to begin only has to
+be met by the first words.
+
 ### Speaker protection
 Keeps bass the driver cannot deliver from muddying everything above it. Leave
 it on.
@@ -275,6 +297,23 @@ whichever device heard you *best*. That was dropped: it taxed every wake by
 signal-to-noise winner produced a *worse* transcript than the device that
 simply heard you first.
 
+### Wake sound
+Plays a short rising tone when the Echo hears the wake word. Off by
+default, because it adds a beat between the wake word and the request. It's
+there first as an accessibility option: without it the ring is the only sign
+the Echo is listening, which is no help from the next room or to someone who
+cannot see it.
+
+**Wake sound level** sets it to Quiet, Medium or Loud. The level is the
+same whatever the Echo's volume is set to, so a turned-down Echo still
+confirms it heard you.
+
+Only the Echo that answers plays it: one that stands down for another (see
+**Arbitration window**), or that has no Home Assistant behind it, stays
+silent. That means the Echo waits to hear back from the controller first,
+one network round trip. Needs firmware that announces `wake_cue`; on older
+firmware the toggle is disabled and says so.
+
 ### Sensitivity (Precise ↔ Eager)
 The confidence bar the recogniser must clear.
 
@@ -293,7 +332,9 @@ Lets the wake word **interrupt the assistant mid-turn** — say the wake word
 while it is reading you a paragraph (or still thinking about your last
 question) and it stops and listens. **Turn on Echo cancel (AEC) first**:
 barge-in works by leaving the microphones live while the device speaks, and
-AEC is what stops it hearing itself.
+AEC is what stops it hearing itself. On an Echo set to **On this Echo** it is
+the Echo that listens for the interruption, and nothing is sent while the
+reply plays unless it hears the wake word.
 
 The **barge threshold** is the wake confidence required during playback, and
 counter-intuitively it sits *lower* than the normal wake threshold. The
@@ -343,17 +384,16 @@ noise (TV, air-con) if wake detection is unreliable there. Off by default —
 it's a "try it and compare" option.
 
 ### Wake word detection
-Who decides you said the wake word. Three settings:
+Where the wake word is heard. Set per Echo; two choices.
 
-- **Controller** (default) — the Dot streams audio and the controller
-  listens. What EchoMuse has always done.
-- **Both (compare)** — the Echo *also* runs the same model over the same
-  audio and reports what it would have detected, without acting on it. It
-  never triggers a turn. This is the one to use first: it tells you whether
-  on-device detection is trustworthy on your hardware, in your room, before
-  anything depends on it.
-- **On device** — the Echo decides, and the controller starts the turn on
-  its word.
+- **On this Echo** (default for new installs) — the Echo listens for the
+  wake word itself and **sends nothing until it hears it**. Then it sends
+  what you say until you stop speaking, and goes back to listening on its
+  own. Talking over a reply (barge-in) is also heard on the Echo.
+- **On the controller** — the Echo **streams its microphone to the
+  controller all the time**, on your network, and the controller listens.
+  This is how EchoMuse worked before private listening, and installs from
+  before it keep this setting until you change it.
 
 ### Wake-word sample capture
 For collecting examples to improve a custom wake model, enable **Save
@@ -370,61 +410,37 @@ controller retains at most 50 clips per Echo. Capture is off by default, and
 clips are admin-only because they may contain ordinary speech. A phrase that
 scores below the chosen minimum on both detectors will not be captured.
 
-**Why you might want "On device".** The wake decision stops crossing your
-network, so it is not delayed by a bad moment on the link. On a marginal
-connection that is the difference between a Dot that responds promptly and
-one that lags unpredictably.
+Under the setting, a line says what the Echo is actually doing right now,
+from its own report rather than from the setting: listening privately,
+streaming, or **button only** with the reason. The home screen has one line
+for the whole fleet — for example *1 of 3 connected Echoes streams audio
+continuously*. The full rules, including exactly when audio leaves an Echo,
+are in [listening.md](listening.md).
 
-Be clear about what it does **not** do:
 
-- **It does not reduce network traffic.** The audio still streams
-  continuously, because the controller runs the rest of the turn.
-- **It does not keep working without the controller.** The wake word is only
-  the first step; the turn itself needs the controller for Home Assistant,
-  the microphone stream and the spoken reply. A wake detected while the
-  controller is down lights the ring and goes nowhere.
+Things to know about **On this Echo**:
 
-The controller keeps listening alongside it, which keeps the comparison in
-**Activity** running so you can see whether the two agree. That costs nothing
-*extra* — it is the same work the controller was already doing in
-**Controller** mode — but it is work that is no longer strictly needed once
-you trust the device, and on a busy Home Assistant machine you may prefer not
-to pay for it. **Both (compare)** is the mode built for measuring; consider
-dropping back to it when you want the numbers rather than leaving them
-running forever.
+- **It needs files on the Dot** that aren't part of the firmware — ONNX
+  Runtime plus the wake-word models, about 15MB, in
+  `/data/local/share/echomuse/oww`. The controller installs them when the Echo
+  connects. Until they are there the Echo is **button only**: it does not
+  quietly fall back to streaming, and the dashboard says why.
+- **It costs the Echo about 0.4 of a CPU core, all the time**, because it is
+  now doing the listening. The Dot 2 has room for it; the **Resources** panel
+  on the Status tab shows it.
+- **It needs recent firmware.** Older firmware streams in every mode, and the
+  dashboard shows it as streaming with "update the firmware for private
+  listening" until you do.
+- **A false wake sends a few seconds of audio you did not intend.** That is
+  true of every wake word system, Amazon's included.
+- **Activity has no controller score for these turns**, and the near-miss
+  counter shows `—`: the controller never hears the audio, so there is
+  nothing to compare.
 
-Barge-in — interrupting a response by speaking over it — is scored by the
-controller in every mode and is unaffected by this setting.
-
-Each voice turn's row in **Activity** shows both scores side by side, and
-the per-device activity API returns an agreement summary (how often they
-agreed, how far apart in milliseconds, and crossings the device saw that
-never became a turn).
-
-**Multi-device caveat.** If you have several Echos in earshot of each other,
-put only one on **On device** for now. The rule that stops two Dots
-answering at once still judges claims by when they arrive rather than when
-each Echo actually heard you, so a device whose message was delayed can lose
-to one that heard you less well. With a single device set this way, or with
-Echos that cannot hear each other, this does not apply.
-
-Three things to know before leaving Controller:
-
-- **It needs files installed on the Dot** that aren't part of the firmware —
-  ONNX Runtime plus the wake-word models, about 15MB, placed in
-  `/data/local/share/echomuse/oww`. They're deliberately not shipped in the
-  firmware image, because that would double both the download and the space
-  each of the two firmware slots takes. Until they're there, the setting does
-  nothing and the device log says which file is missing.
-- **It costs about half a CPU core, permanently**, because the wake stream is
-  always on. Measured on an Echo Dot Gen 2 that has capacity for it — the mic
-  pipeline was unaffected across hours of use, including during music
-  playback — but enable it on **one device at a time** and watch the
-  **Resources** panel on the Status tab.
-- **It needs recent firmware**, and the two settings need different
-  vintages: scoring shipped before triggering did. Each option is disabled
-  and says so on an Echo whose firmware cannot do it, rather than appearing
-  to work.
+**Mixed fleets are fine.** When one utterance wakes more than one Echo, the
+one that *heard* you first answers, whichever side detected it — claims are
+compared by when the audio was captured, not when the message arrived, so a
+slow link no longer hands the answer to the wrong room.
 
 ---
 
@@ -637,7 +653,12 @@ bug, and it stays banished from that path).
 
 ### Speech gate
 
-Decides when a button-press utterance starts and stops:
+Decides when a button-press or follow-up utterance starts and stops. On
+current firmware the Dot decides "is this speech" with a small speech model
+(Silero) once the controller has installed it alongside the wake word files,
+so loud non-speech — music under a duck, a fan, the TV — no longer holds a
+turn open. The **Threshold** below is then only its fallback, used until the
+model is installed; the two gate timings apply either way.
 
 - **Threshold** — how loud counts as "speech". Measured in pre-gain units
   (the mic gain doesn't change what this number means). The default 0.001
@@ -680,6 +701,11 @@ Two things to know before enabling:
 - The proxy is **receive-only** (passive scanning). Devices that need an
   active connection to read data (some smart locks, older BLE devices)
   aren't supported — advert-based sensors and presence tracking are.
+- The Dot's WiFi and Bluetooth **share one antenna**, and scanning costs the
+  WiFi link. So the scan **pauses automatically** while the Dot is hearing
+  you, while a reply is arriving, and while its console or an update is
+  running, then resumes; presence tracking loses a few seconds per voice
+  turn.
 
 Diagnostics live on the device's **Status tab** (Bluetooth proxy panel):
 scanner state, advertisements seen, nearby device count, and whether Home
@@ -705,33 +731,44 @@ about two minutes for the device to drop off and come back.
 ### Static controller endpoint
 
 Devices normally find the controller with link-local mDNS. If a device
-reaches the controller through a routed tunnel or an isolated VLAN where
-mDNS cannot cross, create `/data/local/etc/echomuse/controller.json` on the
-device with an ordered list of endpoints:
+reaches the controller through a routed tunnel or an isolated VLAN where mDNS
+cannot cross, list the controller's address under **Config → Advanced →
+Controller address**. It applies to the whole fleet, with no per-device
+override:
+
+- Each entry is an IP address or a host name, with the device port and the
+  encrypted (TLS) port. They start as this controller's own; a TLS port of `0`
+  means that address has no encrypted listener.
+- Echos try the addresses in order, twice each, then look for the controller
+  by mDNS once before starting again. A wrong address therefore slows a
+  reconnect down; it cannot leave an Echo unable to find its controller.
+- Saving writes the list to every connected Echo straight away; the rest get
+  it when they next connect. An Echo uses it from its next reconnect, with no
+  restart. The provisioning wizard writes it to a new Echo as it stands when
+  the wizard runs.
+- Needs firmware v2.16.0 or later. Older firmware ignores it and uses mDNS.
+
+The list lands on the device as `/data/local/etc/echomuse/controller.json`,
+which the firmware re-reads on every reconnect attempt. You can still write
+that file by hand, for example to turn the mDNS fallback off for a test fleet
+that must never reach another controller:
 
 ```json
 {
   "endpoints": [
     {"host": "10.20.40.110", "port": 8767, "tls_port": 8770},
-    {"host": "10.20.40.111", "port": 8767, "tls_port": 8770},
     {"host": "controller.example.internal", "port": 8767, "tls_port": 8770}
-  ]
+  ],
+  "mdns": false
 }
 ```
 
-A static address, a backup address and a DNS name all behave identically —
-list them in whatever order you want tried first. When this file is present
-and valid, the device skips mDNS and dials the first endpoint, even while
-it's initially unreachable, so a device-local tunnel can finish starting
-without leaving EchoMuse stranded in the mDNS retry loop. If an endpoint
-stays unreachable, the device falls through to the next one in the list on
-the following retry rather than pinning to a stale address; each `tls_port`
-may be `0` when that controller's encrypted device listener is disabled.
-
-The file is re-read on every reconnect attempt, so editing it (or removing
-it, to restore automatic mDNS discovery) takes effect on the device's next
-retry — no restart needed, which matters most on exactly the device this
-feature is for: one that can't currently reach its controller.
+The dashboard list wins. While it is empty the controller leaves a
+hand-written file alone; once you set a list, it replaces the file on every
+Echo, including any hand edits. The provisioning wizard goes further: it
+writes the list as set, and with none set it removes any `controller.json`
+the device already has, so a device from a previous setup cannot carry
+another controller's addresses.
 
 ---
 
@@ -744,7 +781,7 @@ These are set once, on the server, and need a controller restart to change:
 | `SERVER_IP` | The controller computer's LAN IP — what devices are told to connect to. Leave it empty to detect it from this host; the controller refuses to start rather than advertise an address it had to guess at, and warns if the detected one looks like a container bridge. |
 | `OWW_MODEL` / `OWW_THRESHOLD` | Startup defaults for wake word/sensitivity — the dashboard values override these. |
 | `DEVICE_APPROVAL` | `strict` (you approve every new device — recommended) or `auto`. |
-| `SERVER_TLS_PORT` | Encrypted device link (wss) port — default 8770, `0` disables. Devices switch to it automatically once they hold pushed credentials (wizard install, or the **Secure link** button on the device Status tab). |
+| `SERVER_TLS_PORT` | Encrypted device link (wss) port — default 8770, `0` disables. Devices switch to it automatically once they hold credentials: from the wizard, from approving a new device, or from pairing (hold the Echo's action button 5 s, then **Approve pairing**). |
 | `REQUIRE_DEVICE_TLS` | Set to `1` **only after every device shows "wss (TLS)"** on its Status tab — from then on the controller rejects unencrypted or tokenless device connections. |
 | `EM_EXTRA_CA_CERT` | Path to a PEM CA certificate to trust — needed if Home Assistant, or a media server you stream from, is served over HTTPS with your own internal certificate authority. See below. |
 
@@ -856,7 +893,10 @@ it still asks GitHub when you press it.
 ### What never leaves
 
 - **Voice audio and transcripts.** Mic audio goes from the device to your
-  controller and on to your Home Assistant, over your LAN. What happens next
+  controller and on to your Home Assistant, over your LAN — on an Echo set to
+  **On this Echo**, only after it hears the wake word and until you stop
+  speaking; on one set to **On the controller**, continuously to the
+  controller. What happens next
   is whatever your Assist pipeline does — if you have configured HA to use a
   cloud speech-to-text service, HA sends it there. EchoMuse itself sends it
   nowhere but HA.

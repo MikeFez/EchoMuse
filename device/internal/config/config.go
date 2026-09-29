@@ -12,6 +12,8 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+
+	"github.com/wilbowes/EchoMuse/internal/outchain"
 )
 
 // Device holds all runtime-tunable parameters for this device.
@@ -46,6 +48,15 @@ type Device struct {
 	// reasoning as the LED meter response curve — not something to discover
 	// via a firmware OTA per attempt.
 	DuckDb float64
+
+	// WakeSound plays a short rising two-tone when the wake word is
+	// recognised (#120). Off by default: it interrupts "<wakeword>, do this".
+	// An accessibility option first — the ring is the only other sign the
+	// device is listening, and no use to someone who cannot see it.
+	WakeSound bool
+	// WakeSoundLevel is "quiet", "medium" or "loud" (internal/cue).
+	WakeSoundLevel string
+
 	// OwwOnDevice selects on-device wake word scoring: "off", "shadow" or
 	// "on".
 	//
@@ -133,6 +144,12 @@ type Device struct {
 	// keeps the old behaviour.
 	ListeningAnim json.RawMessage
 
+	// Output is the speaker output chain's configuration (eqBands,
+	// eqLoudness, bassGuard*, limiter*). Held here whether or not the
+	// controller has handed the chain to this device, so the values are
+	// already correct the moment it does. Read with OutputChain().
+	Output outchain.Params
+
 	initialised bool
 }
 
@@ -163,6 +180,8 @@ func (d *Device) loadDefaults() {
 	d.OwwOnDevice = normaliseOnDevice(envStr("OWW_ON_DEVICE", OnDeviceOff))
 	d.BargeInThreshold = envFloat("BARGE_IN_THRESHOLD", 0.05)
 	d.DuckDb = envFloat("DUCK_DB", -18)
+	d.WakeSound = envBool("WAKE_SOUND", false)
+	d.WakeSoundLevel = envStr("WAKE_SOUND_LEVEL", "medium")
 	d.AdcDigitalGain = envInt("ADC_DIGITAL_GAIN", 88)
 	d.AdcMicpga = envInt("ADC_MICPGA", 40)
 	d.MicGainDb = clampMicGainDb(envInt("MIC_GAIN_DB", 24))
@@ -182,6 +201,7 @@ func (d *Device) loadDefaults() {
 	d.AecRefSource = normaliseAecRef(envStr("EM_AEC_HW_REF", AecRefAuto))
 	bleProxyEnabled := envBool("BLE_PROXY_ENABLED", false)
 	d.BleProxyEnabled = &bleProxyEnabled
+	d.Output = outchain.DefaultParams()
 }
 
 // Apply updates the config from a controller-pushed config message.
@@ -226,6 +246,12 @@ func (d *Device) Apply(msg ConfigMessage) {
 	if msg.DuckDb != nil {
 		d.DuckDb = *msg.DuckDb
 	}
+	if msg.WakeSound != nil {
+		d.WakeSound = *msg.WakeSound
+	}
+	if msg.WakeSoundLevel != "" {
+		d.WakeSoundLevel = msg.WakeSoundLevel
+	}
 	if msg.StartupVolume > 0 {
 		d.StartupVolume = msg.StartupVolume
 	}
@@ -265,6 +291,51 @@ func (d *Device) Apply(msg ConfigMessage) {
 	if msg.ListeningAnim != nil {
 		d.ListeningAnim = msg.ListeningAnim
 	}
+	applyOutput(&d.Output, msg)
+}
+
+// WakeSoundSetting reports whether the wake sound is on, and at what level.
+func (d *Device) WakeSoundSetting() (on bool, level string) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return d.WakeSound, d.WakeSoundLevel
+}
+
+// applyOutput merges the output-chain keys. Every one of them has a
+// legitimate zero — a flat band, a 0dBFS threshold, "off" — so each is a
+// pointer (or a slice) and absent means untouched. eqBands shorter than
+// NumBands pads with 0, as em_eq does; longer is truncated.
+func applyOutput(p *outchain.Params, msg ConfigMessage) {
+	if msg.EqBands != nil {
+		var b [outchain.NumBands]float64
+		copy(b[:], msg.EqBands)
+		p.Bands = b
+	}
+	if msg.EqLoudness != nil {
+		p.Loudness = *msg.EqLoudness
+	}
+	if msg.BassGuardEnabled != nil {
+		p.GuardEnabled = *msg.BassGuardEnabled
+	}
+	if msg.BassGuardDb != nil {
+		p.GuardDb = *msg.BassGuardDb
+	}
+	if msg.LimiterEnabled != nil {
+		p.LimiterEnabled = *msg.LimiterEnabled
+	}
+	if msg.LimiterThreshold != nil {
+		p.LimiterThresholdDb = *msg.LimiterThreshold
+	}
+	if msg.LimiterRelease != nil {
+		p.LimiterReleaseMs = *msg.LimiterRelease
+	}
+}
+
+// OutputChain returns the output chain's current configuration.
+func (d *Device) OutputChain() outchain.Params {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return d.Output
 }
 
 // Snapshot returns a consistent copy of all config values.
@@ -378,6 +449,19 @@ type ConfigMessage struct {
 	AecTailMs          int      `json:"aecTailMs,omitempty"`
 	AecRefSource       string   `json:"aecRefSource,omitempty"`
 	BleProxyEnabled    *bool    `json:"bleProxyEnabled,omitempty"`
+	// WakeSound: a pointer so "off" is distinguishable from absent.
+	WakeSound      *bool  `json:"wakeSound,omitempty"`
+	WakeSoundLevel string `json:"wakeSoundLevel,omitempty"`
+
+	// Output chain (internal/outchain). Pointers because zero is a real
+	// setting for every one of them; see applyOutput.
+	EqBands          []float64 `json:"eqBands,omitempty"`
+	EqLoudness       *bool     `json:"eqLoudness,omitempty"`
+	BassGuardEnabled *bool     `json:"bassGuardEnabled,omitempty"`
+	BassGuardDb      *float64  `json:"bassGuardDb,omitempty"`
+	LimiterEnabled   *bool     `json:"limiterEnabled,omitempty"`
+	LimiterThreshold *float64  `json:"limiterThreshold,omitempty"`
+	LimiterRelease   *float64  `json:"limiterRelease,omitempty"`
 
 	// ListeningAnim: raw led_anim spec for the listening ring (#263).
 	// Carried as raw JSON so this package does not depend on the

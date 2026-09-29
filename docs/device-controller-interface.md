@@ -43,6 +43,17 @@ All three exist in plain (`ws://`) and TLS (`wss://`) form; see
 [Link auth & TLS](#link-auth--tls). The `/shell` plane is not dialled until the
 controller asks for it.
 
+**Keepalive and loss.** The controller sends a WebSocket ping every 20s on each
+plane and closes a connection after **30s** with no pong
+(`WS_PING_TIMEOUT_S`); answer pings promptly, which means never blocking the
+goroutine or thread that reads the socket. Home WiFi loses packets, so a device
+should set **`TCP_THIN_LINEAR_TIMEOUTS`** on its sockets (Linux: retransmit on a
+linear timer while under four segments are in flight, instead of doubling);
+the controller sets it on its end. On a board whose radio shares an antenna
+with Bluetooth, **stop any BLE scan while the link carries a turn, a reply or
+a shell session** — on the Dot a running scan made the AP resend 47-150% of
+frames (see "The LE scan costs the WiFi link" in `device/CLAUDE.md`).
+
 ## Registration and capabilities
 
 Immediately after the `/control` socket opens, the device sends one `register`
@@ -57,6 +68,7 @@ message (`device/internal/client/control.go`):
   "ip": "<local ip, omitted if 127.0.0.1 or unresolved>",
   "ambient_light_status": { "...": "..." },
   "base_os": "emos | fireos | unknown",
+  "pairing": true,  // only during a pairing window (capability `pairing`)
   "board": "<pkg/board id, or unknown>",
   "kernel_arch": "<uname -m, e.g. aarch64>",
   "kernel_release": "<uname -r, e.g. 3.18.19+>"
@@ -68,7 +80,7 @@ informational: the controller stores and displays them, and gates Android-only
 payloads on `base_os`. The kernel pair is omitted if `uname` fails. A device
 for a new board should send all of them.
 
-`capabilities` is the negotiation signal. The Dot announces ten unconditionally
+`capabilities` is the negotiation signal. The Dot announces twelve unconditionally
 plus one conditional (`capabilities()` in `control.go`):
 
 | Capability | Condition | Meaning |
@@ -82,8 +94,12 @@ plus one conditional (`capabilities()` in `control.go`):
 | `oww_trigger` | always | Can **act** on its own wake detection — kept separate from `oww_shadow` on purpose (see below) |
 | `button_hold` | always | Emits long-press (`heldMs`) |
 | `audio_mix` | always | Holds music on its own frame types and mixes it under voice rather than pausing |
+| `oww_local_only` | always | Can listen **privately**: score its own wake word and send nothing until it fires. Whether it is doing so is `listen_state` — see [listening.md](listening.md) |
 | `aec_hw_ref` | always | Can take the AEC far-end reference from a playback loopback in the mic capture itself, and falls back to the software tap at the ALSA write when the board has none |
+| `output_chain` | always | Can run the speaker output chain (EQ → bass guard → limiter) itself, at the ALSA write, from the config keys `eqBands`, `eqLoudness`, `limiter*`, `bassGuard*`. Runs it only when the controller's `ack` carries `output_chain` too, which is the controller saying it has stopped processing: either half alone keeps the old path, so audio is never shaped twice |
+| `wake_cue` | always | Can generate its own wake sound, at `wakeSoundLevel`, independent of volume. Plays it when `wakeSound` is on and a wake has WON: on `listen_ack` for a private-listening session, or on `play_cue` otherwise — never at the crossing, so a ceded wake is silent |
 | `ambient_light` | only if the sensor is actually readable (`als.Present()`) | Reports light readings |
+| `pairing` | always | Asks to pair itself when its owner holds the action button 5 s: a `pair_request` every 5 s on a live link, or otherwise registers with `"pairing": true` on every dial for the 2-minute window, falling back to plain (without its token) when wss cannot connect. The window closes early once new credentials land, so the redial they cause does not ask again. Without it the controller offers the admin a **Pair** action instead, since the device cannot ask |
 
 **`aec_hw_ref` is a capability with a runtime companion, and both are needed.**
 The capability says the firmware knows *how* to use a hardware echo reference.
@@ -136,22 +152,30 @@ absent optional fields take prior/default behaviour.
 | `mute_state` | `muted` | Mute toggled (mute is device-sovereign — see `device/CLAUDE.md`) |
 | `volume_state` | `level` | Volume changed; controller persists it as `startupVolume` |
 | `oww_shadow_cross` | score/threshold/age fields | Shadow-mode wake crossing (report only) |
-| `oww_wake` | score, effective threshold, age | On-device trigger fired (`owwOnDevice=on`); lands in `Device.pending_wake` |
+| `oww_wake` | `score`, `threshold`, `ageMs`, `capturedMono`; `level`, `peak` when the crossing frame is still buffered; under private listening also `session`, `floor`, `barge` | On-device trigger fired (`owwOnDevice=on`). With `session` it opened a private-listening session whose audio follows as `0x07` ([listening.md](listening.md)); without, it lands in `Device.pending_wake` and the continuous stream carries the audio. `level`/`peak` are the wake word's loudness in dBFS with `micGainDb` removed, over the 2.0s ending at the crossing frame (definition: `controller/em_wakelevel.py`); logged, not acted on |
+| `listen_state` | `state` (`local`/`stream`/`degraded`), `reason?` | What the device is doing with its wake stream. Sent on every change and after every `ack` |
+| `listen_end` | `session`, `reason` | The device closed a session itself (`ack_timeout`, `max_open`, `muted`, `link`, `stopped`) |
 | `ambient_light` | `value` | Light reading (only if `ambient_light`) |
+| `stats` | hardware and link telemetry (`internal/client/stats.go`, `DeviceStats`) | Every ~30s, plus once on connect. Every field is optional and absence means **not measured**, never zero. `tcpUpRetrans` is the device's own TCP retransmits across its planes since the last report, `tcpUpSegs` the segments sent where the kernel counts them (FireOS 5's 3.18 does not); `ble` carries the scanner's counters, including `yields`/`yieldedMs` for time the scan stood aside for the link |
 | `ble_adverts` | `adverts[]` | Batch from the passive BLE scanner. **Legacy path** — send these on `/data` as `0x06` whenever the controller announced `ble_adverts_data`, and use this message only when it did not (#404) |
 | `wifi_scan_result` | `networks[]` of `{ssid, ssid_hex, signal}`, or `error` | Answer to `wifi_scan` |
 | `wifi_result` | `ok`, `ssid`, `error?` | Outcome of a `wifi_change`, re-sent until `wifi_commit` |
-| `pong` | — | Keepalive reply |
+| `pair_request` | — | The owner held the action button on a connected device (only if `pairing`). The controller shows **Approve pairing**; approval issues a rotated token and the CA over the shell plane, then bounces the link |
+| `pong` | `id`, `mono` when answering a `ping` that carried an `id` | Keepalive reply. `id` echoes the ping's; `mono` is the device's monotonic clock in ms (any fixed origin), which the controller maps onto its own to date `capturedMono`. Unsolicited keepalive pongs carry neither |
 
 **Controller → Device**
 
 | `type` | Payload | Meaning |
 |--------|---------|---------|
-| `ack` | `device_id`, `features[]` | Registration accepted. `features` is the CONTROLLER's capability list — the mirror of the device's own, and read the same way: a feature that is absent is one the controller cannot do. Absent entirely on controllers before 2.23.0 |
+| `ack` | `device_id`, `features[]` | Registration accepted. `features` is the CONTROLLER's capability list — the mirror of the device's own, and read the same way: a feature that is absent is one the controller cannot do. Absent entirely on controllers before 2.23.0. Current: `ble_adverts_data`, `listen_session`, `output_chain` |
+| `refused` | — | Not admitted: link auth refused this device's credentials (a wrong token, or a token it has stopped presenting). Sent before the close; firmware with `pairing` shows the refused ring, which tells the owner to hold the action button to pair. A device also treats a TLS certificate its CA did not sign as refused. Older firmware ignores it |
+| `pending` | `pairing?` | Not admitted: the device is unapproved, or with `pairing:true` its pairing request is recorded and waiting for an admin. Keep redialling within the window; an approval admits the next dial |
 | `leds` | `leds[]`, `listening?` | One LED frame; `listening:true` marks the listening ring so the direction overlay keys off it |
 | `led_anim` | `{pattern, colors, periodMs, ttlSec}` | Local animation spec; sent only if `led_anim` |
 | `mic_start` | `lock_mic?` | Start mic stream. `lock_mic:false`/absent = always-on ungated wake stream; `true` = bounded, VAD-gated turn |
-| `mic_stop` | — | Stop the mic stream |
+| `mic_stop` | — | Stop the mic stream. Under private listening it ends a bounded turn but **not** a session (only `listen_close` does, by id) and **not** local listening, which is what hears a barge-in |
+| `listen_ack` | `session` | A private-listening wake was taken; stops the device's 3s ack clock |
+| `listen_close` | `session`, `reason` | End that session. Ignored if it is not the open one |
 | `beam_lock` / `beam_unlock` | — | Lock beamformer to the chosen perimeter mic for a turn / return to omni |
 | `volume_set` | `level` | Set absolute volume |
 | `duck` | `on` | Duck music under a voice turn (turn start/end) |
@@ -159,6 +183,7 @@ absent optional fields take prior/default behaviour.
 | `wifi_scan` | — | Scan for networks; answered with `wifi_scan_result` |
 | `wifi_change` / `wifi_commit` | `ssid`, `ssid_hex?`, `psk` / — | Switch WiFi with auto-rollback; commit finalises |
 | `shell_open` / `shell_close` | `pty?` | Ask the device to dial `/shell` (`pty:true` = interactive) / close it |
+| `play_cue` | `cue` | Play a cue the device generates itself. Only `"wake"` today, sent when `wakeSound` is on and a wake outside a private-listening session has won arbitration; unknown names are ignored |
 | `music_flush` / `speaker_flush` | — | Flush the music / voice buffer (barge-in uses `speaker_flush`) |
 
 **An SSID is 0–32 arbitrary bytes**, so a name alone cannot always address
@@ -192,6 +217,7 @@ board implementer must not read a single global table.
 | `0x04` | VAD-end | Bounded turn: speech was detected, then ended |
 | `0x05` | no-speech-timeout | Bounded turn: no speech ever detected before the timeout |
 | `0x06` | ble adverts | Batch of scanned BLE advertisements — **only if the controller announced `ble_adverts_data`** |
+| `0x07` | session audio | `[0x07][session u32 BE][seq u16 BE][PCM]` — private-listening audio, **only if the controller announced `listen_session`** |
 
 `0x04`/`0x05` are safe to reuse because playback frames only ever flow to the
 device and capture frames only ever flow from it. The two capture sentinels are
@@ -206,6 +232,13 @@ Mic stream shapes (`device/CLAUDE.md`, Device audio pipeline):
 - **Bounded turn stream** (`lock_mic:true`) is VAD-gated with a preroll ring,
   ends with a `0x04` sentinel when the gate closes after speech, and ends with
   `0x05` if no speech arrived within the timeout.
+- **Private listening** (`owwOnDevice=on`, device announces `oww_local_only`,
+  controller announces `listen_session`): the always-on stream still runs, but
+  on the device only — it feeds the local scorer and sends nothing. A wake
+  opens a session and its audio goes up as `0x07` until the controller closes
+  it at end of speech or a device-side limit does. The full contract is
+  [listening.md](listening.md); a new board that scores locally should
+  implement it rather than stream.
 
 ### `0x06` — BLE advertisements
 
@@ -261,12 +294,13 @@ ledScene, ledListenColor, ledThinkColor,
 meterAttack, meterDecay, meterFloor, meterGamma, meterRef, meterCurve,
 wakeArbitrationMs, duckDb,
 buttonSingleTapEvent, buttonMultiTapMs,
-owwOnDevice, saveUtterances
+owwOnDevice, saveUtterances, streamReply,
+wakeSound, wakeSoundLevel
 ```
 
 Not every field is acted on by the device. The output-chain keys (`limiter*`,
-`bassGuard*`), `eq*`, `saveUtterances`, `wakeArbitrationMs`, and the `button*`
-timing keys are **controller-side** — that processing happens before the audio
+`bassGuard*`), `eq*`, `saveUtterances`, `streamReply`, `wakeArbitrationMs`, and the
+`button*` timing keys are **controller-side** — that processing happens before the audio
 reaches the wire, or is used only for config scoping. `owwOnDevice` is both
 controller-consumed (scoping) and device-acted. A new board only needs to
 implement the keys relevant to hardware it actually has; unknown keys are
@@ -277,19 +311,28 @@ ignored, which is the correct degrade.
 - All three planes carry an `X-EM-Token` header, read from the device's
   credential file on **every dial** (`device/internal/client/tlscreds.go`), so
   a pushed credential takes effect on the next reconnect without a restart.
-- TLS is selected when the device has a CA on disk **and** the controller
-  advertises a `tls_port` mDNS TXT record → dial `wss://`. CA present but no TXT
-  → plain with a warning (deliberate rollout fallback). The server identity is
-  the fixed DNS SAN `echomuse-controller`, never an IP.
+  A device holding a CA **never** sends its token on a plain dial.
+- A device with a CA on disk dials **only** `wss://`, at the `tls_port` from
+  mDNS TXT or its endpoint file; with no `tls_port` it does not dial at all.
+  The one exception is a pairing window (`pairing`, below): wss first, then
+  plain without the token, both registering with `"pairing": true`. A device
+  with no CA dials plain. The server identity is the fixed DNS SAN
+  `echomuse-controller`, never an IP.
 - Certs are backdated/long-lived **and** the device clamps its verification
   clock to the firmware build time, because an Echo boots with a bogus clock
   pre-NTP and a device that cannot connect cannot fix its clock. A new board
   inherits this — do not "normalise" either half.
 - Enforcement is `em_linkauth.decide` (`controller/em_linkauth.py`): a wrong
-  token always rejects; a stored token with none presented is allowed (the
-  credential push itself rides the plain plane); a token for a device with
-  nothing on record is ignored, not rejected. `REQUIRE_DEVICE_TLS=1` makes
-  TLS+token mandatory.
+  token always rejects; a stored token with none presented is allowed only
+  until the device has presented it once (the credential push itself rides
+  the plain plane), and refused after that; a token for a device with nothing
+  on record is ignored, not rejected. `REQUIRE_DEVICE_TLS=1` makes TLS+token
+  mandatory. **A device binary must send its token on all three planes**, or
+  it is refused on the ones that lack it once the controller has seen it.
+- `/data` and `/shell` are admitted only from the address, and with the
+  scheme, of the device's live `/control` connection
+  (`em_linkauth.follows_control`), so a real device must dial all three from
+  one address.
 
 ## What the device binary owns
 
@@ -375,6 +418,12 @@ worth reading before writing crown-specific bindings.
 - Pending capabilities reported before the ESPHome server exists are not lost.
 - A capability change bounces the HA connection so the entity list refreshes.
 - A disabled UI control does not silently write when its capability is absent.
+- Private listening is negotiated both ways: `oww_local_only` from the device,
+  `listen_session` on the ack, with the same strings on both sides.
+
+The session rules themselves — the device-side deadlines, the ring, which
+session a frame may reach — are pinned by `device/internal/listen` and
+`controller/tests/test_listen.py`.
 
 A board or protocol change that breaks one of these must update the test with
 the reason, not route around it.

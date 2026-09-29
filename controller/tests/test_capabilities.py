@@ -317,3 +317,20 @@ def test_the_controller_announces_its_own_features_and_the_device_reads_them():
         f"controller announces {announced - consumed} which the device never "
         f"looks for — the feature would never be used and nothing would say so"
     )
+
+
+def test_private_listening_is_negotiated_in_both_directions():
+    """docs/listening.md: the device listens privately only against a
+    controller announcing listen_session, and the controller treats a device
+    as private-capable only on oww_local_only. The literals in em_controller
+    are what the two tests above cross-check against the Go; em_listen's
+    constants must be the same strings or the pure logic reads a different
+    capability from the one negotiated."""
+    import sys
+    sys.path.insert(0, str(ROOT / "controller"))
+    import em_listen
+    py = CONTROLLER.read_text()
+    assert f'"{em_listen.FEATURE}"' in py[py.index("CONTROLLER_FEATURES = ["):][:200]
+    assert f'"{em_listen.CAPABILITY}" in (self.capabilities' in py
+    assert em_listen.CAPABILITY in device_capabilities()
+    assert re.search(r'FeatureListenSession\s*=\s*"listen_session"', CONTROL_GO.read_text())
