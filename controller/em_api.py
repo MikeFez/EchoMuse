@@ -68,6 +68,7 @@ import em_oww_models
 import em_pki
 import em_player
 import em_recordings
+import em_wake_samples
 import em_volume
 import em_wifi
 import em_scenes
@@ -379,6 +380,10 @@ async def create_app() -> web.Application:
     app.router.add_get("/api/devices/{id}/turns",         _get_device_turns)
     app.router.add_get("/api/devices/{id}/activity",      _get_device_activity)
     app.router.add_get("/api/devices/{id}/turns/{turn}/audio", _get_turn_audio)
+    app.router.add_get("/api/devices/{id}/wake-samples", _get_wake_samples)
+    app.router.add_patch("/api/devices/{id}/wake-samples/{sample}", _patch_wake_sample)
+    app.router.add_delete("/api/devices/{id}/wake-samples/{sample}", _delete_wake_sample)
+    app.router.add_get("/api/devices/{id}/wake-samples/{sample}/audio", _get_wake_sample_audio)
     app.router.add_post("/api/devices/{id}/wifi",         _post_device_wifi)
     app.router.add_post("/api/devices/{id}/wifi/scan",    _post_device_wifi_scan)
     app.router.add_post("/api/devices/{id}/update",       _post_device_update)
@@ -843,6 +848,72 @@ def _slug(text: str) -> str:
     return out or "device"
 
 
+@auth.require_admin
+async def _get_wake_samples(request: web.Request) -> web.Response:
+    device_id = request.match_info["id"]
+    try:
+        limit = min(max(int(request.query.get("limit", 50)), 1), 100)
+    except ValueError:
+        return _error("bad_request", "limit must be an integer", 400)
+    loop = asyncio.get_event_loop()
+    rows = await loop.run_in_executor(None, db.get_wake_samples, device_id, limit)
+    return _ok([dict(row) for row in rows])
+
+
+@auth.require_admin
+async def _patch_wake_sample(request: web.Request) -> web.Response:
+    device_id = request.match_info["id"]
+    try:
+        sample_id = int(request.match_info["sample"])
+    except ValueError:
+        return _error("bad_request", "sample must be an integer", 400)
+    body = await _json_body(request)
+    label = body.get("label")
+    if label not in ("wake", "not_wake", "uncertain"):
+        return _error("bad_request", "label must be wake, not_wake, or uncertain", 400)
+    loop = asyncio.get_event_loop()
+    ok = await loop.run_in_executor(None, db.set_wake_sample_label,
+                                    device_id, sample_id, label)
+    return _ok({"id": sample_id, "label": label}) if ok else _error(
+        "sample_not_found", "No wake sample with that id", 404)
+
+
+@auth.require_admin
+async def _delete_wake_sample(request: web.Request) -> web.Response:
+    device_id = request.match_info["id"]
+    try:
+        sample_id = int(request.match_info["sample"])
+    except ValueError:
+        return _error("bad_request", "sample must be an integer", 400)
+    loop = asyncio.get_event_loop()
+    name = await loop.run_in_executor(None, db.delete_wake_sample,
+                                      device_id, sample_id)
+    if name is None:
+        return _error("sample_not_found", "No wake sample with that id", 404)
+    await loop.run_in_executor(None, em_wake_samples.remove, device_id, [name])
+    return _ok({"id": sample_id, "deleted": True})
+
+
+@auth.require_admin
+async def _get_wake_sample_audio(request: web.Request) -> web.Response:
+    device_id = request.match_info["id"]
+    try:
+        sample_id = int(request.match_info["sample"])
+    except ValueError:
+        return _error("bad_request", "sample must be an integer", 400)
+    loop = asyncio.get_event_loop()
+    rows = await loop.run_in_executor(None, db.get_wake_samples, device_id, 100)
+    row = next((item for item in rows if item["id"] == sample_id), None)
+    path = em_wake_samples.resolve(device_id, row["audio_file"]) if row else None
+    if path is None:
+        return _error("no_recording", "No saved audio for this sample", 404)
+    return web.FileResponse(path, headers={
+        "Content-Type": "audio/wav",
+        "Content-Disposition": f'attachment; filename="{_slug(device_id)}-wake{sample_id}.wav"',
+        "Cache-Control": "private, max-age=60",
+    })
+
+
 @auth.require_auth
 async def _get_device_activity(request: web.Request) -> web.Response:
     """GET /api/devices/{id}/activity?days=7 — aggregated activity stats
@@ -1142,6 +1213,15 @@ async def _apply_live_config(device_id: str, live, effective: dict) -> None:
         live.ns_asr = bool(effective["nsAsr"])
     if "saveUtterances" in effective:
         live.save_utterances = bool(effective["saveUtterances"])
+    if "wakeClipCapture" in effective:
+        live.wake_clip_capture = bool(effective["wakeClipCapture"])
+        if not live.wake_clip_capture:
+            live.wake_capture.reset()
+    if "wakeClipMinScore" in effective:
+        try:
+            live.wake_clip_min_score = max(0.05, min(0.95, float(effective["wakeClipMinScore"])))
+        except (TypeError, ValueError):
+            live.wake_clip_min_score = 0.20
     if "bargeInEnabled" in effective:
         live.barge_in_enabled = bool(effective["bargeInEnabled"])
     if "bargeInThreshold" in effective:

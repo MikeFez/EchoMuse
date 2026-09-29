@@ -81,6 +81,7 @@ import em_limiter
 import em_mbc
 import em_scenes
 import em_shadow
+import em_wake_samples
 import em_oww_warmup
 import em_barge
 import em_arbiter
@@ -472,6 +473,11 @@ class Device:
         # switching it off stops the next turn being captured, not the one
         # already streaming.
         self.save_utterances: bool = False
+        # Wake-word training clips use the already-streamed wake audio. The
+        # default is off because these clips may contain private speech.
+        self.wake_clip_capture: bool = False
+        self.wake_clip_min_score: float = 0.20
+        self.wake_capture: em_wake_samples.WakeCapture = em_wake_samples.WakeCapture()
         # This turn's captured mic audio, handed from _stream_mic_audio to
         # _persist_turn (which owns the write — it has the rowid the
         # filename is keyed on) and consumed there.
@@ -2995,6 +3001,15 @@ async def wake_word_listener(device: Device):
                 source = em_shadow.decide_wake_source(
                     device.oww_on_device, dev_wake, ctrl_hit
                 )
+                if trusted or source != "none":
+                    device.wake_capture.consider(
+                        enabled=device.wake_clip_capture,
+                        minimum=device.wake_clip_min_score,
+                        score=float(score), threshold=float(eff_threshold),
+                        model=current_model_name,
+                        device_score=(dev_wake["score"] if dev_wake is not None else None),
+                        trigger_source=(source if source != "none" else None),
+                    )
                 if ctrl_hit and device.oww_on_device == em_shadow.MODE_ON:
                     # "on" mode, and this controller heard it too. Recorded for
                     # the comparison and nothing else — the device is driving.
@@ -4088,6 +4103,18 @@ async def handle_control(ws: WebSocketServerProtocol, secure: bool = False):
                         # for comparison ONLY — nothing here starts a turn, and
                         # that is the entire point of shadow mode.
                         device.shadow.record_cross(msg.get("score"), msg.get("ageMs"))
+                        try:
+                            device.wake_capture.consider(
+                                enabled=device.wake_clip_capture,
+                                minimum=device.wake_clip_min_score,
+                                score=None,
+                                threshold=float(device.shadow.threshold or device.oww_threshold),
+                                model=device.oww_model,
+                                device_score=float(msg.get("score") or 0.0),
+                                trigger_source="device",
+                            )
+                        except (TypeError, ValueError):
+                            pass
                         log.info(
                             f"[{device_id}] on-device wake crossing: "
                             f"score={msg.get('score')} age={msg.get('ageMs')}ms "
@@ -4109,6 +4136,18 @@ async def handle_control(ws: WebSocketServerProtocol, secure: bool = False):
                         # controller-triggered one and the Activity tab does not
                         # have to special-case which side fired.
                         device.shadow.record_cross(msg.get("score"), msg.get("ageMs"))
+                        try:
+                            device.wake_capture.consider(
+                                enabled=device.wake_clip_capture,
+                                minimum=device.wake_clip_min_score,
+                                score=None,
+                                threshold=float(msg.get("threshold") or device.oww_threshold),
+                                model=device.oww_model,
+                                device_score=float(msg.get("score") or 0.0),
+                                trigger_source="device",
+                            )
+                        except (TypeError, ValueError):
+                            pass
                         if device.oww_on_device != em_shadow.MODE_ON:
                             # Firmware triggering while the controller thinks it
                             # should not: a config push in flight, or a rollback
@@ -4285,6 +4324,27 @@ async def _release_device_services(device) -> None:
         log.error(f"[{device.device_id}] delayed service release failed: {e}")
 
 
+# ─── Wake-word sample capture ─────────────────────────────────────────────────
+
+def _store_wake_candidate(device_id: str, sample: dict) -> int | None:
+    """Write the bounded clip and its review metadata off the event loop."""
+    name = em_wake_samples.filename(device_id)
+    if name is None or not em_wake_samples.save(device_id, name, sample["pcm"]):
+        return None
+    record = {k: v for k, v in sample.items() if k != "pcm"}
+    record["audio_file"] = name
+    try:
+        return db.insert_wake_sample(device_id, record)
+    except Exception:
+        em_wake_samples.remove(device_id, [name])
+        raise
+
+
+async def _persist_wake_candidate(device, sample: dict) -> None:
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, _store_wake_candidate, device.device_id, sample)
+
+
 # ─── Data plane handler ───────────────────────────────────────────────────────
 
 async def handle_data(ws: WebSocketServerProtocol, secure: bool = False):
@@ -4380,6 +4440,14 @@ async def handle_data(ws: WebSocketServerProtocol, secure: bool = False):
                         log.error(f"[{device.device_id}] VAD sentinel lost — queue still full after drain")
                     continue
                 payload = raw[MIC_HEADER_LEN:]
+                # Keep only a 1.5s in-memory pre-roll during ordinary
+                # listening. When a candidate/trigger has opened a clip, the
+                # same tap collects its bounded post-roll, including turn audio.
+                if device.wake_clip_capture or device.wake_capture.active is not None:
+                    completed = device.wake_capture.feed_audio(payload)
+                    if completed is not None:
+                        asyncio.create_task(_persist_wake_candidate(device, completed)) \
+                            .add_done_callback(_log_task_exception)
                 q = device.voice_queue if device.oww_paused.is_set() else device.mic_queue
                 try:
                     q.put_nowait(payload)

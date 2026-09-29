@@ -56,7 +56,8 @@ the Status row reads `Online`, or `Offline` with how long ago the device was
 last heard from) and **Activity** (voice-turn history — what was heard, how it was
 transcribed, wake-word scores, playback underruns, near-misses, and — if
 **Save utterances** is on — the recorded audio of each turn, playable and
-downloadable). Activity
+downloadable). If **Save wake-word samples** is on, Activity also lists
+score candidates and detector hits for review and labeling. Activity
 history is stored in the controller's database, so it survives controller
 and device restarts; hourly hardware trends (CPU, memory, WiFi signal) are
 kept for 180 days and available via the API
@@ -353,6 +354,21 @@ Who decides you said the wake word. Three settings:
   anything depends on it.
 - **On device** — the Echo decides, and the controller starts the turn on
   its word.
+
+### Wake-word sample capture
+For collecting examples to improve a custom wake model, enable **Save
+wake-word samples** under Config → Wake word. The controller keeps a short
+in-memory audio buffer and saves a clip when its score reaches **Minimum
+sample score**, plus every actual wake trigger. In **Both (compare)** mode it
+also saves crossings reported by the Echo. A clip includes audio before and
+after the score peak; it does not continuously write room audio to disk.
+
+Review clips in the device's Activity panel. Label each as **Wake word**,
+**Not wake word**, or **Unsure**. This makes a reviewable set of positive and
+negative examples; it does not train or change the model automatically. The
+controller retains at most 50 clips per Echo. Capture is off by default, and
+clips are admin-only because they may contain ordinary speech. A phrase that
+scores below the chosen minimum on both detectors will not be captured.
 
 **Why you might want "On device".** The wake decision stops crossing your
 network, so it is not delayed by a bad moment on the link. On a marginal
