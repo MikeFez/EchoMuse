@@ -1,3 +1,4 @@
+import json
 import wave
 
 import pytest
@@ -181,6 +182,53 @@ def test_delete_unlinks_audio_while_its_row_still_exists(fresh_db, monkeypatch):
     assert observed == [True]
     assert db.get_wake_samples("dev1") == []
     assert not samples.resolve("dev1", name)
+
+
+def test_labeling_archives_the_sample_with_its_metadata(fresh_db):
+    name = samples.filename("dev1")
+    assert samples.save("dev1", name, _pcm())
+    db.insert_wake_sample("dev1", {
+        "ts": 1000, "audio_file": name, "kind": "trigger", "model": "hey_vanessa",
+        "score": .8, "threshold": .5, "device_score": .7, "trigger_source": "controller",
+    })
+    row = db.get_wake_samples("dev1")[0]
+
+    assert db.set_wake_sample_label("dev1", row["id"], "wake")
+
+    archived = samples.archive_dir("wake") / name
+    sidecar = samples.archive_dir("wake") / (name[:-4] + ".json")
+    assert archived.is_file()
+    meta = json.loads(sidecar.read_text())
+    assert meta["model"] == "hey_vanessa" and meta["score"] == .8
+
+
+def test_archive_survives_retention_pruning_of_the_original(fresh_db):
+    name = samples.filename("dev1")
+    assert samples.save("dev1", name, _pcm())
+    row_id = db.insert_wake_sample("dev1", {"ts": 0, "audio_file": name, "kind": "candidate"})
+    assert db.set_wake_sample_label("dev1", row_id, "not_wake")
+    archived = samples.archive_dir("not_wake") / name
+
+    for i in range(1, samples.KEEP_PER_DEVICE + 2):
+        db.insert_wake_sample("dev1", {
+            "ts": i, "audio_file": samples.filename("dev1"), "kind": "candidate",
+        })
+
+    assert not samples.resolve("dev1", name)  # original pruned
+    assert archived.is_file()  # archived copy untouched
+
+
+def test_archive_survives_explicit_deletion_of_the_original(fresh_db):
+    name = samples.filename("dev1")
+    assert samples.save("dev1", name, _pcm())
+    row_id = db.insert_wake_sample("dev1", {"ts": 1, "audio_file": name, "kind": "candidate"})
+    assert db.set_wake_sample_label("dev1", row_id, "uncertain")
+    archived = samples.archive_dir("uncertain") / name
+
+    assert db.delete_wake_sample("dev1", row_id) == name
+
+    assert not samples.resolve("dev1", name)
+    assert archived.is_file()
 
 
 def test_deleting_device_removes_sample_rows_and_audio(fresh_db, monkeypatch):

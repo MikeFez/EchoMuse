@@ -2559,11 +2559,26 @@ def set_wake_sample_label(device_id: str, sample_id: int, label: str) -> bool:
     if label not in ("wake", "not_wake", "uncertain"):
         return False
     with _tx() as conn:
+        row = conn.execute(
+            """SELECT audio_file, kind, model, score, threshold, device_score,
+                      trigger_source, ts FROM wake_samples
+               WHERE device_id = ? AND id = ?""",
+            (device_id, int(sample_id)),
+        ).fetchone()
+        if row is None:
+            return False
         cur = conn.execute(
             "UPDATE wake_samples SET label = ? WHERE device_id = ? AND id = ?",
             (label, device_id, int(sample_id)),
         )
-        return cur.rowcount == 1
+        updated = cur.rowcount == 1
+    # Best-effort: a failed archive copy must not fail the label call itself.
+    if updated:
+        try:
+            em_wake_samples.archive(device_id, row["audio_file"], label, dict(row))
+        except Exception as e:
+            log.warning(f"[db] Wake sample archive failed for {device_id}/{sample_id}: {e}")
+    return updated
 
 
 def delete_wake_sample(device_id: str, sample_id: int) -> str | None:

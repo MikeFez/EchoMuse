@@ -8,8 +8,10 @@ from __future__ import annotations
 
 import collections
 import io
+import json
 import os
 import re
+import shutil
 import time
 import uuid
 import wave
@@ -23,6 +25,10 @@ POST_ROLL_SECONDS = 1.25
 MAX_CLIP_BYTES = 5 * SAMPLE_RATE * SAMPLE_WIDTH
 KEEP_PER_DEVICE = 50
 SUBDIR = "wake_samples"
+# Labeling a sample also copies it here, permanently and uncapped - the 50-per-device
+# cap above still applies to the reviewable copy, so a label is what survives it.
+ARCHIVE_SUBDIR = "wake_samples_archive"
+ARCHIVE_LABELS = ("wake", "not_wake", "uncertain")
 _NAME_RE = re.compile(r"^(?P<device>[A-Za-z0-9_.-]{1,64})_(?P<token>[a-f0-9]{32})\.wav$")
 
 
@@ -30,6 +36,12 @@ def samples_dir(db_path: str | None = None) -> Path:
     if db_path is None:
         db_path = os.environ.get("DB_PATH", "echomuse.db")
     return Path(db_path).resolve().parent / "recordings" / SUBDIR
+
+
+def archive_dir(label: str, db_path: str | None = None) -> Path:
+    if db_path is None:
+        db_path = os.environ.get("DB_PATH", "echomuse.db")
+    return Path(db_path).resolve().parent / "recordings" / ARCHIVE_SUBDIR / label
 
 
 def safe_device_id(device_id: str) -> bool:
@@ -72,6 +84,24 @@ def resolve(device_id: str, name: str, db_path: str | None = None) -> Path | Non
         return None
     path = samples_dir(db_path) / name
     return path if path.is_file() else None
+
+
+def archive(device_id: str, name: str, label: str, meta: dict, db_path: str | None = None) -> bool:
+    """Copy a labeled sample plus its metadata into the permanent archive. Best-effort:
+    a False return should not fail the label call itself."""
+    if parse_filename(name) != device_id or label not in ARCHIVE_LABELS:
+        return False
+    src = samples_dir(db_path) / name
+    if not src.is_file():
+        return False
+    try:
+        directory = archive_dir(label, db_path)
+        directory.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, directory / name)
+        (directory / (name[:-len(".wav")] + ".json")).write_text(json.dumps(meta, indent=2))
+        return True
+    except OSError:
+        return False
 
 
 def unlink(device_id: str, name: str, db_path: str | None = None) -> bool:

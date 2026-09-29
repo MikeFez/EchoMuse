@@ -405,10 +405,21 @@ after the score peak; it does not continuously write room audio to disk.
 
 Review clips in the device's Activity panel. Label each as **Wake word**,
 **Not wake word**, or **Unsure**. This makes a reviewable set of positive and
-negative examples; it does not train or change the model automatically. The
-controller retains at most 50 clips per Echo. Capture is off by default, and
-clips are admin-only because they may contain ordinary speech. A phrase that
-scores below the chosen minimum on both detectors will not be captured.
+negative examples; it does not train or change the model automatically.
+Labeling also copies the clip into a permanent, uncapped store on disk,
+organised by label, alongside its score and model as a small metadata
+file — so a clip worth keeping survives the 50-per-device limit below rather
+than eventually being pruned with everything else. Capture is off by default,
+and clips are admin-only because they may contain ordinary speech. A phrase
+that scores below the chosen minimum on both detectors will not be captured.
+
+Both the reviewable clips and the labeled archive are plain WAV files on
+disk, in `data/recordings/wake_samples/` and
+`data/recordings/wake_samples_archive/<label>/` respectively — never
+uploaded anywhere. The controller retains at most **50 clips per Echo** in
+the first folder, oldest pruned automatically; the second has no limit and
+nothing removes from it. Turning capture off stops new clips immediately but
+leaves existing ones, reviewable or archived, exactly where they are.
 
 Under the setting, a line says what the Echo is actually doing right now,
 from its own report rather than from the setting: listening privately,
@@ -906,6 +917,11 @@ it still asks GitHub when you press it.
   Assistant add-on every household user can reach the dashboard, so read-only
   accounts get turn timings, scores and outcomes without the speech. Enforced
   on the server, not just hidden in the page.
+- **Wake-word sample clips** (`wakeClipCapture`, off by default) — written to
+  disk beside the database and never uploaded, same as utterance recordings
+  above. Playing, downloading, labeling and deleting them is admin-only.
+  Labeling a clip additionally copies it into a permanent archive on disk,
+  organised by label — still never uploaded, still admin-only to reach.
 - **Device serials, WiFi credentials, network names and your fleet's
   configuration.** These live only in the controller's database.
 - **Support bundles** are built only when you ask for one, and sharing the
