@@ -9519,7 +9519,12 @@ function DeviceConfigForm({ config, onChange, disabled, sections, onScopeChange,
                   ]}
                   onChange={v => set('wakeSoundLevel', v)}/>
               )}
-
+              {/* Where the wake word is detected (docs/listening.md). Two
+                  choices; "shadow" is a developer diagnostic, set through the
+                  API and shown here only on an Echo already in it, labelled as
+                  the streaming mode it is. "On this Echo" needs oww_trigger —
+                  shadow shipped first and there is firmware in the field that
+                  scores and reports without being able to act on it. */}
               <Select
                 label="Wake word detection"
                 sub={!shadowCapable
