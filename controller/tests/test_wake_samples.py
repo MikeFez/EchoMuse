@@ -91,12 +91,119 @@ def test_retention_is_bounded_per_device(fresh_db):
     assert rows[0]["ts"] == samples.KEEP_PER_DEVICE + 2
 
 
-def test_deleting_device_removes_sample_rows_and_audio(fresh_db):
+def test_retention_unlinks_audio_while_its_row_still_exists(fresh_db, monkeypatch):
+    first = samples.filename("dev1")
+    assert samples.save("dev1", first, _pcm())
+    db.insert_wake_sample("dev1", {
+        "ts": 0, "audio_file": first, "kind": "candidate",
+    })
+    for i in range(1, samples.KEEP_PER_DEVICE):
+        db.insert_wake_sample("dev1", {
+            "ts": i, "audio_file": samples.filename("dev1"), "kind": "candidate",
+        })
+
+    unlink = samples.unlink
+    observed = []
+
+    def check_then_unlink(device_id, name, db_path=None):
+        row = db._conn.execute(
+            "SELECT 1 FROM wake_samples WHERE device_id = ? AND audio_file = ?",
+            (device_id, name),
+        ).fetchone()
+        observed.append(row is not None)
+        return unlink(device_id, name, db_path)
+
+    monkeypatch.setattr(samples, "unlink", check_then_unlink)
+    db.insert_wake_sample("dev1", {
+        "ts": samples.KEEP_PER_DEVICE, "audio_file": samples.filename("dev1"),
+        "kind": "candidate",
+    })
+
+    assert observed == [True]
+    assert not samples.resolve("dev1", first)
+    assert len(db.get_wake_samples("dev1", 100)) == samples.KEEP_PER_DEVICE
+
+
+def test_retention_keeps_metadata_when_audio_cannot_be_unlinked(fresh_db, monkeypatch):
+    names = []
+    for i in range(samples.KEEP_PER_DEVICE):
+        name = samples.filename("dev1")
+        names.append(name)
+        db.insert_wake_sample("dev1", {
+            "ts": i, "audio_file": name, "kind": "candidate",
+        })
+    monkeypatch.setattr(samples, "unlink", lambda *_a, **_kw: False)
+
+    with pytest.raises(OSError, match="could not remove expired wake sample"):
+        db.insert_wake_sample("dev1", {
+            "ts": samples.KEEP_PER_DEVICE,
+            "audio_file": samples.filename("dev1"), "kind": "candidate",
+        })
+
+    rows = db.get_wake_samples("dev1", 100)
+    assert len(rows) == samples.KEEP_PER_DEVICE
+    assert {row["audio_file"] for row in rows} == set(names)
+
+
+def test_delete_keeps_metadata_when_audio_cannot_be_unlinked(fresh_db, monkeypatch):
+    name = samples.filename("dev1")
+    assert samples.save("dev1", name, _pcm())
+    db.insert_wake_sample("dev1", {"ts": 1, "audio_file": name, "kind": "candidate"})
+    row = db.get_wake_samples("dev1")[0]
+    monkeypatch.setattr(samples, "unlink", lambda *_a, **_kw: False)
+
+    with pytest.raises(OSError, match="could not remove wake sample"):
+        db.delete_wake_sample("dev1", row["id"])
+
+    assert db.get_wake_samples("dev1")[0]["id"] == row["id"]
+    assert samples.resolve("dev1", name).is_file()
+
+
+def test_delete_unlinks_audio_while_its_row_still_exists(fresh_db, monkeypatch):
+    name = samples.filename("dev1")
+    assert samples.save("dev1", name, _pcm())
+    db.insert_wake_sample("dev1", {"ts": 1, "audio_file": name, "kind": "candidate"})
+    row = db.get_wake_samples("dev1")[0]
+    unlink = samples.unlink
+    observed = []
+
+    def check_then_unlink(device_id, sample_name, db_path=None):
+        found = db._conn.execute(
+            "SELECT 1 FROM wake_samples WHERE device_id = ? AND audio_file = ?",
+            (device_id, sample_name),
+        ).fetchone()
+        observed.append(found is not None)
+        return unlink(device_id, sample_name, db_path)
+
+    monkeypatch.setattr(samples, "unlink", check_then_unlink)
+    assert db.delete_wake_sample("dev1", row["id"]) == name
+
+    assert observed == [True]
+    assert db.get_wake_samples("dev1") == []
+    assert not samples.resolve("dev1", name)
+
+
+def test_deleting_device_removes_sample_rows_and_audio(fresh_db, monkeypatch):
     name = samples.filename("dev1")
     assert samples.save("dev1", name, _pcm())
     db.insert_wake_sample("dev1", {"ts": 1, "audio_file": name, "kind": "candidate"})
     path = samples.resolve("dev1", name)
     assert path and path.is_file()
+
+    unlink = samples.unlink
+    observed = []
+
+    def check_then_unlink(device_id, sample_name, db_path=None):
+        found = db._conn.execute(
+            "SELECT 1 FROM wake_samples WHERE device_id = ? AND audio_file = ?",
+            (device_id, sample_name),
+        ).fetchone()
+        observed.append(found is not None)
+        return unlink(device_id, sample_name, db_path)
+
+    monkeypatch.setattr(samples, "unlink", check_then_unlink)
     db.delete_device("dev1")
+
+    assert observed == [True]
     assert db.get_wake_samples("dev1") == []
     assert not path.exists()

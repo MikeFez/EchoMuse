@@ -919,7 +919,6 @@ async def _delete_wake_sample(request: web.Request) -> web.Response:
                                       device_id, sample_id)
     if name is None:
         return _error("sample_not_found", "No wake sample with that id", 404)
-    await loop.run_in_executor(None, em_wake_samples.remove, device_id, [name])
     return _ok({"id": sample_id, "deleted": True})
 
 

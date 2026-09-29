@@ -1964,8 +1964,8 @@ def delete_device(device_id: str) -> None:
     Remove a device and its persisted records from the registry.
 
     This is a hard delete — use with care. Logs are removed first to
-    satisfy foreign keys. Wake-sample rows are removed in the same
-    transaction, and their audio files are unlinked immediately afterwards.
+    satisfy foreign keys. Wake-sample audio is unlinked before its rows,
+    within the transaction, so a cleanup failure leaves references for retry.
 
     Saved utterance recordings live on disk rather than in the DB, so no
     cascade reaches them — they are unlinked explicitly here. Leaving a
@@ -1977,6 +1977,11 @@ def delete_device(device_id: str) -> None:
         wake_samples = conn.execute(
             "SELECT audio_file FROM wake_samples WHERE device_id = ?", (device_id,)
         ).fetchall()
+        for row in wake_samples:
+            if not em_wake_samples.unlink(device_id, row["audio_file"]):
+                raise OSError(
+                    f"could not remove wake sample {row['audio_file']} for {device_id}"
+                )
         conn.execute("DELETE FROM wake_samples WHERE device_id = ?", (device_id,))
         conn.execute("DELETE FROM devices WHERE device_id = ?", (device_id,))
     try:
@@ -1985,10 +1990,6 @@ def delete_device(device_id: str) -> None:
             log.info(f"[db] Removed {removed} recording(s) for {device_id}")
     except Exception as e:
         log.warning(f"[db] Recording cleanup failed for {device_id}: {e}")
-    try:
-        em_wake_samples.remove(device_id, [r["audio_file"] for r in wake_samples])
-    except Exception as e:
-        log.warning(f"[db] Wake sample cleanup failed for {device_id}: {e}")
     log.info(f"[db] Device deleted: {device_id}")
 
 
@@ -2532,9 +2533,16 @@ def insert_wake_sample(device_id: str, rec: dict) -> int:
             (device_id, em_wake_samples.KEEP_PER_DEVICE),
         ).fetchall()
         if expired:
+            # Unlink before deleting metadata. If the process stops during
+            # cleanup, the rows remain available to retry the removals.
+            for row in expired:
+                if not em_wake_samples.unlink(device_id, row["audio_file"]):
+                    raise OSError(
+                        f"could not remove expired wake sample "
+                        f"{row['audio_file']} for {device_id}"
+                    )
             conn.executemany("DELETE FROM wake_samples WHERE id = ?",
                              [(r["id"],) for r in expired])
-    em_wake_samples.remove(device_id, [r["audio_file"] for r in expired])
     return sample_id
 
 
@@ -2566,6 +2574,10 @@ def delete_wake_sample(device_id: str, sample_id: int) -> str | None:
         ).fetchone()
         if row is None:
             return None
+        if not em_wake_samples.unlink(device_id, row["audio_file"]):
+            raise OSError(
+                f"could not remove wake sample {row['audio_file']} for {device_id}"
+            )
         conn.execute("DELETE FROM wake_samples WHERE device_id = ? AND id = ?",
                      (device_id, int(sample_id)))
         return row["audio_file"]

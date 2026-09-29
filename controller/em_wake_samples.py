@@ -74,15 +74,21 @@ def resolve(device_id: str, name: str, db_path: str | None = None) -> Path | Non
     return path if path.is_file() else None
 
 
+def unlink(device_id: str, name: str, db_path: str | None = None) -> bool:
+    """Remove one owned sample file; report errors so its DB row can remain."""
+    if parse_filename(name) != device_id:
+        return False
+    try:
+        (samples_dir(db_path) / name).unlink(missing_ok=True)
+        return True
+    except OSError:
+        return False
+
+
 def remove(device_id: str, names, db_path: str | None = None) -> None:
-    directory = samples_dir(db_path)
+    """Best-effort cleanup for files whose database insert did not succeed."""
     for name in names:
-        if parse_filename(name) != device_id:
-            continue
-        try:
-            (directory / name).unlink(missing_ok=True)
-        except OSError:
-            pass
+        unlink(device_id, name, db_path)
 
 
 class WakeCapture:

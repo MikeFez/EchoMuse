@@ -4798,18 +4798,9 @@ async def handle_control(ws: WebSocketServerProtocol, secure: bool = False):
                         # for comparison ONLY — nothing here starts a turn, and
                         # that is the entire point of shadow mode.
                         device.shadow.record_cross(msg.get("score"), msg.get("ageMs"))
-                        try:
-                            device.wake_capture.consider(
-                                enabled=device.wake_clip_capture,
-                                minimum=device.wake_clip_min_score,
-                                score=None,
-                                threshold=float(device.shadow.threshold or device.oww_threshold),
-                                model=device.oww_model,
-                                device_score=float(msg.get("score") or 0.0),
-                                trigger_source="device",
-                            )
-                        except (TypeError, ValueError):
-                            pass
+                        _consider_on_device_wake_sample(
+                            device, msg, device.shadow.threshold
+                        )
                         log.info(
                             f"[{device_id}] on-device wake crossing: "
                             f"score={msg.get('score')} age={msg.get('ageMs')}ms "
@@ -4831,18 +4822,9 @@ async def handle_control(ws: WebSocketServerProtocol, secure: bool = False):
                         # controller-triggered one and the Activity tab does not
                         # have to special-case which side fired.
                         device.shadow.record_cross(msg.get("score"), msg.get("ageMs"))
-                        try:
-                            device.wake_capture.consider(
-                                enabled=device.wake_clip_capture,
-                                minimum=device.wake_clip_min_score,
-                                score=None,
-                                threshold=float(msg.get("threshold") or device.oww_threshold),
-                                model=device.oww_model,
-                                device_score=float(msg.get("score") or 0.0),
-                                trigger_source="device",
-                            )
-                        except (TypeError, ValueError):
-                            pass
+                        _consider_on_device_wake_sample(
+                            device, msg, msg.get("threshold")
+                        )
                         if msg.get("session"):
                             # Private listening: the wake opened a session.
                             ev = em_listen.parse_wake(msg, asyncio.get_event_loop().time())
@@ -5084,6 +5066,22 @@ async def _release_device_services(device) -> None:
 
 
 # ─── Wake-word sample capture ─────────────────────────────────────────────────
+
+def _consider_on_device_wake_sample(device, msg: dict, threshold) -> None:
+    """Record either kind of on-device crossing through the same capture path."""
+    try:
+        device.wake_capture.consider(
+            enabled=device.wake_clip_capture,
+            minimum=device.wake_clip_min_score,
+            score=None,
+            threshold=float(threshold or device.oww_threshold),
+            model=device.oww_model,
+            device_score=float(msg.get("score") or 0.0),
+            trigger_source="device",
+        )
+    except (TypeError, ValueError):
+        pass
+
 
 def _store_wake_candidate(device_id: str, sample: dict) -> int | None:
     """Write the bounded clip and its review metadata off the event loop."""
