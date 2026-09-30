@@ -49,6 +49,7 @@ def samples_dir(db_path: str | None = None) -> Path:
 
 
 def archive_dir(label: str, db_path: str | None = None) -> Path:
+    """Where a labeled sample's permanent, uncapped copy lives, one directory per label."""
     if db_path is None:
         db_path = os.environ.get("DB_PATH", "echomuse.db")
     return Path(db_path).resolve().parent / "recordings" / ARCHIVE_SUBDIR / label
@@ -97,8 +98,8 @@ def resolve(device_id: str, name: str, db_path: str | None = None) -> Path | Non
 
 
 def archive(device_id: str, name: str, label: str, meta: dict, db_path: str | None = None) -> bool:
-    """Copy a labeled sample plus its metadata into the permanent archive. Best-effort:
-    a False return should not fail the label call itself."""
+    """Copy a labeled sample plus its metadata into the permanent archive.
+    Best-effort: a False return should not fail the label call itself."""
     if parse_filename(name) != device_id or label not in ARCHIVE_LABELS:
         return False
     src = samples_dir(db_path) / name
