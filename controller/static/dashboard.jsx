@@ -9501,8 +9501,8 @@ function DeviceConfigForm({ config, onChange, disabled, sections, onScopeChange,
                 <span style={{ fontFamily: mono, fontSize: 9, color: 'var(--muted)' }}>Eager</span>
               </div>
               <Slider label="Arbitration window" sub="ms that the first Echo to hear you silences the others — no added delay; 0 disables" value={config.wakeArbitrationMs ?? 700} min={0} max={2000} step={50} unit="ms" onChange={v => set('wakeArbitrationMs', v)}/>
-              <Toggle label="Save wake-word samples" sub="saves score candidates and actual triggers for review in Activity; clips stay on this controller" value={config.wakeClipCapture ?? false} onChange={v => set('wakeClipCapture', v)}/>
-              <Slider label="Minimum sample score" sub="lower catches quieter near-misses but saves more ordinary speech; actual triggers are always saved" value={config.wakeClipMinScore ?? 0.20} min={0.05} max={0.95} step={0.01} formatValue={v => v.toFixed(2)} onChange={v => set('wakeClipMinScore', v)}/>
+              <Toggle label="Save wake-word samples" sub="saves clips for review in Activity" value={config.wakeClipCapture ?? false} onChange={v => set('wakeClipCapture', v)}/>
+              <Slider label="Minimum sample score" sub="lower catches more near-misses, but more ordinary speech too" value={config.wakeClipMinScore ?? 0.20} min={0.05} max={0.95} step={0.01} formatValue={v => v.toFixed(2)} onChange={v => set('wakeClipMinScore', v)}/>
               {/* Accessibility first: the ring is the only other sign the Echo
                   is listening. Disabled with the reason on firmware that cannot
                   play it, never a switch that saves and stays silent. */}
