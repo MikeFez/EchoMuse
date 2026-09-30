@@ -56,6 +56,61 @@ def test_trigger_promotes_candidate_and_floor_rearms_after_score_drops():
     assert capture.active is not None
 
 
+def test_trigger_uses_the_short_post_roll_even_with_continued_speech():
+    capture = samples.WakeCapture()
+    capture.feed_audio(_pcm(), now=0)
+    capture.consider(enabled=True, minimum=.2, score=.7, threshold=.5,
+                     model="m", trigger_source="controller", now=.5)
+    assert capture.active["until"] == .5 + samples.TRIGGER_POST_ROLL_SECONDS
+    # Ordinary speech right after the wake word, still above the (low) floor,
+    # must not re-arm with the long candidate window instead.
+    capture.consider(enabled=True, minimum=.2, score=.25, threshold=.5, model="m", now=.6)
+    assert capture.active["until"] == .6 + samples.TRIGGER_POST_ROLL_SECONDS
+    assert capture.active["until"] < .6 + samples.POST_ROLL_SECONDS
+    done = capture.feed_audio(_pcm(), now=.6 + samples.TRIGGER_POST_ROLL_SECONDS + .01)
+    assert done is not None and done["kind"] == "trigger"
+
+
+def test_candidate_keeps_the_long_post_roll():
+    capture = samples.WakeCapture()
+    capture.feed_audio(_pcm(), now=0)
+    capture.consider(enabled=True, minimum=.2, score=.3, threshold=.6, model="m", now=.5)
+    assert capture.active["kind"] == "candidate"
+    assert capture.active["until"] == .5 + samples.POST_ROLL_SECONDS
+
+
+def test_tail_trim_shortens_a_trigger_clip_but_not_a_candidate():
+    frame = samples.SAMPLE_RATE * 80 // 1000 * samples.SAMPLE_WIDTH
+
+    trigger = samples.WakeCapture()
+    for i in range(30):
+        trigger.feed_audio(_pcm(), now=i * .08)
+    trigger.consider(enabled=True, minimum=.2, score=.7, threshold=.5,
+                      model="m", trigger_source="controller", now=2.4)
+    before = len(trigger.active["pcm"])
+    done = trigger.feed_audio(_pcm(), now=2.4 + samples.TRIGGER_POST_ROLL_SECONDS + .01)
+    assert done is not None
+    assert len(done["pcm"]) == before + frame - samples.TRIGGER_TAIL_TRIM_BYTES
+
+    candidate = samples.WakeCapture()
+    for i in range(30):
+        candidate.feed_audio(_pcm(), now=i * .08)
+    candidate.consider(enabled=True, minimum=.2, score=.3, threshold=.6, model="m", now=2.4)
+    before = len(candidate.active["pcm"])
+    done = candidate.feed_audio(_pcm(), now=2.4 + samples.POST_ROLL_SECONDS + .01)
+    assert done is not None
+    assert len(done["pcm"]) == before + frame  # untrimmed
+
+
+def test_tail_trim_does_not_empty_a_short_trigger_clip():
+    capture = samples.WakeCapture()
+    capture.feed_audio(_pcm(), now=0)
+    capture.consider(enabled=True, minimum=.2, score=.9, threshold=.5,
+                      model="m", trigger_source="controller", now=.05)
+    done = capture.feed_audio(_pcm(), now=.05 + samples.TRIGGER_POST_ROLL_SECONDS + .01)
+    assert done is not None and len(done["pcm"]) > 0
+
+
 @pytest.fixture
 def fresh_db(tmp_path, monkeypatch):
     db.init(str(tmp_path / "samples.db"))

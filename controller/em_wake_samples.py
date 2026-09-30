@@ -21,7 +21,17 @@ SAMPLE_RATE = 16000
 SAMPLE_WIDTH = 2
 CHANNELS = 1
 PRE_ROLL_BYTES = int(1.5 * SAMPLE_RATE * SAMPLE_WIDTH)
+# A candidate keeps the long tail: there is no sharp "this is where it ended" moment
+# for a score that never crossed the real threshold, so extra context helps a reviewer.
+# A trigger is a precise, known-timestamp event and gets none added (post-roll 0) plus
+# a fixed trim off the end instead - the pre-roll snapshot is taken at the moment the
+# trigger fires, and any lag between the wake word actually ending and the score
+# crossing threshold is already baked into that snapshot, not into anything a post-roll
+# duration could remove.
 POST_ROLL_SECONDS = 1.25
+TRIGGER_POST_ROLL_SECONDS = 0
+TRIGGER_TAIL_TRIM_SECONDS = 0.2
+TRIGGER_TAIL_TRIM_BYTES = int(TRIGGER_TAIL_TRIM_SECONDS * SAMPLE_RATE * SAMPLE_WIDTH)
 MAX_CLIP_BYTES = 5 * SAMPLE_RATE * SAMPLE_WIDTH
 KEEP_PER_DEVICE = 50
 SUBDIR = "wake_samples"
@@ -183,10 +193,12 @@ class WakeCapture:
         if not candidate and not triggered:
             return
         if self.active is None:
+            kind = "trigger" if triggered else "candidate"
             self.active = {
                 "pcm": bytearray(self._history_pcm()), "started": now,
                 "ts": time.time(),
-                "until": now + POST_ROLL_SECONDS, "kind": "trigger" if triggered else "candidate",
+                "until": now + (TRIGGER_POST_ROLL_SECONDS if kind == "trigger" else POST_ROLL_SECONDS),
+                "kind": kind,
                 "model": model, "score": score, "threshold": float(threshold),
                 "device_score": device_score, "trigger_source": trigger_source,
             }
@@ -199,15 +211,20 @@ class WakeCapture:
         if triggered:
             active["kind"] = "trigger"
             active["trigger_source"] = trigger_source
+        # A trigger's re-arm always uses the short tail, never the candidate window.
         if now - active["started"] < MAX_CLIP_BYTES / (SAMPLE_RATE * SAMPLE_WIDTH):
-            active["until"] = now + POST_ROLL_SECONDS
+            active["until"] = now + (TRIGGER_POST_ROLL_SECONDS if active["kind"] == "trigger" else POST_ROLL_SECONDS)
 
     def _finish(self):
         active, self.active = self.active, None
         if active is None:
             return None
+        pcm = bytes(active["pcm"])
+        # Only a trigger is trimmed, and only if long enough that it can't go negative.
+        if active["kind"] == "trigger" and len(pcm) > TRIGGER_TAIL_TRIM_BYTES:
+            pcm = pcm[:-TRIGGER_TAIL_TRIM_BYTES]
         return {
-            "pcm": bytes(active["pcm"]), "kind": active["kind"],
+            "pcm": pcm, "kind": active["kind"],
             "model": active["model"], "score": active["score"],
             "threshold": active["threshold"], "device_score": active["device_score"],
             "trigger_source": active["trigger_source"], "ts": active["ts"],
