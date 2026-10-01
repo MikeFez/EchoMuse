@@ -94,6 +94,7 @@ import em_limiter
 import em_mbc
 import em_scenes
 import em_shadow
+import em_health
 import em_wake_samples
 import em_oww_warmup
 import em_barge
@@ -405,6 +406,11 @@ class Device:
         self.ip           = ip
         self.capabilities = capabilities
         self.control_ws   = control_ws
+        # The Sendspin player's status (#89), from sendspin_status and the
+        # stats tick; None while the player is off or on firmware without it.
+        self.sendspin: dict | None = None
+        # An outstanding sendspin_token_request, answered by sendspin_token.
+        self.sendspin_token_waiter: asyncio.Future | None = None
         # Set from the register message; None on firmware that predates it.
         self.ambient_light_status: dict | None = None
         # Which userspace the device booted, from its register message.
@@ -413,6 +419,11 @@ class Device:
         # existing fleet exactly as it was.
         self._base_os: str | None = None
         self.kernel_arch: str | None = None
+        # From the register message (schema v28): see em_health.
+        self.boot_reason: str | None = None
+        # The last eMMC wear row written, as (day, values), so a reading that
+        # has not changed since is not rewritten every stats tick.
+        self.wear_written: tuple | None = None
         self.kernel_release: str | None = None
 
         self.data_ws: WebSocketServerProtocol | None = None
@@ -1003,6 +1014,14 @@ class Device:
         starts pairing from the dashboard, since the device cannot ask.
         """
         return "pairing" in (self.capabilities or [])
+
+    @property
+    def sendspin_capable(self) -> bool:
+        """
+        Whether this firmware can be a Sendspin player (#89). The dashboard
+        shows the section disabled with the reason without it.
+        """
+        return "sendspin" in (self.capabilities or [])
 
     @property
     def wake_cue_capable(self) -> bool:
@@ -4197,6 +4216,14 @@ async def handle_control(ws: WebSocketServerProtocol, secure: bool = False):
         device.kernel_release = msg.get("kernel_release") or None
         if device.kernel_arch:
             em_dbwriter.submit(db.set_device_kernel, device_id, device.kernel_arch, device.kernel_release or "")
+        # How this boot started and the eMMC's wear (schema v28), one row per
+        # boot_id: a device re-registers on every redial. Held live too, so
+        # the dashboard shows them without a query. Absent on older firmware.
+        device.boot_reason = msg.get("boot_reason") or None
+        if isinstance(msg.get("boot_id"), str) and msg["boot_id"]:
+            em_dbwriter.submit(db.record_boot, device_id, msg["boot_id"],
+                               msg.get("version"), device.boot_reason)
+        _note_wear(device, msg.get("emmc"))
         # Link-security telemetry for the dashboard: True when this control
         # connection arrived over the TLS listener.
         device.secure = secure
@@ -4250,6 +4277,12 @@ async def handle_control(ws: WebSocketServerProtocol, secure: bool = False):
         if bad_keys:
             log.warning(f"[control] {device_id}: stored config has values of "
                         f"the wrong type, not sent: {', '.join(bad_keys)}")
+        # The Sendspin player advertises itself to Music Assistant under the
+        # device's label, which the firmware does not otherwise know. Carried
+        # on the same push, so the player starts under the right name rather
+        # than restarting a moment later; a rename sends it alone.
+        if device.sendspin_capable and row["label"]:
+            config = {**config, "sendspinName": row["label"]}
         await device.send_control({"type": "config", **config})
         device.oww_threshold = float(config.get("owwThreshold", OWW_THRESHOLD))
         device.oww_model     = config.get("owwModel", f"{OWW_MODEL}_v0.1")
@@ -4274,9 +4307,14 @@ async def handle_control(ws: WebSocketServerProtocol, secure: bool = False):
         # Resolved against the capability — see em_shadow.effective_mode for
         # why "on" against firmware that cannot trigger must become shadow
         # rather than being honoured.
-        device.oww_on_device = em_shadow.effective_mode(
+        new_oww_on_device = em_shadow.effective_mode(
             config.get("owwOnDevice"), device.oww_trigger_capable,
         )
+        if new_oww_on_device != device.oww_on_device:
+            # #696 review: a buffered pre-roll from the old mode must not
+            # carry into the new one.
+            device.wake_capture.reset()
+        device.oww_on_device = new_oww_on_device
         # Wake word assets, start script and debloat, reconciled against what
         # the device actually has — see api.reconcile_on_connect for why the
         # arrival is the trigger. Background: shell round trips and possibly a
@@ -4551,6 +4589,11 @@ async def handle_control(ws: WebSocketServerProtocol, secure: bool = False):
                         esphome.update_device_volume(device_id, device.volume)
 
                     elif msg_type == "stats":
+                        if "sendspin" in msg:
+                            device.sendspin = msg.get("sendspin")
+                        # eMMC wear, re-read on the device every few hours;
+                        # one row per day (schema v28), written on change.
+                        _note_wear(device, msg.get("emmc"))
                         device.stats = {
                             "cpuPct":        msg.get("cpuPct"),
                             "memUsedMb":     msg.get("memUsedMb"),
@@ -4675,8 +4718,26 @@ async def handle_control(ws: WebSocketServerProtocol, secure: bool = False):
                                 # dashboard's Bluetooth panel stays live without
                                 # a full device refresh.
                                 "bleProxy": em_ble_proxy.get_status(device_id),
+                                "sendspin": device.sendspin,
                             },
                         })
+
+                    elif msg_type == "sendspin_status":
+                        # The player's state as it changes (pairing, a stream
+                        # starting); the stats tick carries it too.
+                        device.sendspin = msg.get("status")
+                        await api._push_event({
+                            "type": "device_update", "device_id": device_id,
+                            "state": {"sendspin": device.sendspin},
+                        })
+
+                    elif msg_type == "sendspin_token":
+                        # The answer to sendspin_token_request. A secret: it
+                        # goes to the one waiting request and nowhere else,
+                        # never a log line or an event.
+                        waiter = device.sendspin_token_waiter
+                        if waiter is not None and not waiter.done():
+                            waiter.set_result(msg)
 
                     elif msg_type == "wifi_result":
                         # Outcome of a wifi_change. The device re-sends this
@@ -4824,9 +4885,15 @@ async def handle_control(ws: WebSocketServerProtocol, secure: bool = False):
                         # controller-triggered one and the Activity tab does not
                         # have to special-case which side fired.
                         device.shadow.record_cross(msg.get("score"), msg.get("ageMs"))
-                        _consider_on_device_wake_sample(
-                            device, msg, msg.get("threshold")
-                        )
+                        if device.listen_view.streams:
+                            # Only when this Echo's mic is actually reaching us
+                            # continuously (#696 review) — a private session's
+                            # own pre-roll is never fed (see the data-plane 0x07
+                            # branch), so capturing it here would grab whatever
+                            # stale audio is left from a PRIOR session instead.
+                            _consider_on_device_wake_sample(
+                                device, msg, msg.get("threshold")
+                            )
                         if msg.get("session"):
                             # Private listening: the wake opened a session.
                             ev = em_listen.parse_wake(msg, asyncio.get_event_loop().time())
@@ -4906,6 +4973,9 @@ async def handle_control(ws: WebSocketServerProtocol, secure: bool = False):
                             device.listen_router.close(sess)
                             if device.listen_session == sess:
                                 device.listen_session = None
+                            # #696 review: nothing of this session belongs in a
+                            # later clip.
+                            device.wake_capture.reset()
                             log.info(f"[{device_id}] session {sess} closed on the device "
                                      f"({msg.get('reason')})")
 
@@ -5067,6 +5137,18 @@ async def _release_device_services(device) -> None:
         log.error(f"[{device.device_id}] delayed service release failed: {e}")
 
 
+def _note_wear(device, emmc) -> None:
+    """Store the day's eMMC wear reading, only when the day or the reading changes."""
+    values = em_health.wear_values(emmc)
+    if values is None:
+        return
+    day = time.strftime("%Y-%m-%d", time.gmtime())
+    if device.wear_written == (day, values):
+        return
+    device.wear_written = (day, values)
+    em_dbwriter.submit(db.record_wear, device.device_id, day, values)
+
+
 # ─── Wake-word sample capture ─────────────────────────────────────────────────
 
 def _consider_on_device_wake_sample(device, msg: dict, threshold) -> None:
@@ -5195,11 +5277,10 @@ async def handle_data(ws: WebSocketServerProtocol, secure: bool = False):
                         continue
                     session, _seq, pcm = parsed
                     device.frames_seen_this_connection = True
-                    if device.wake_clip_capture or device.wake_capture.active is not None:
-                        completed = device.wake_capture.feed_audio(pcm)
-                        if completed is not None:
-                            em_tasks.spawn(_persist_wake_candidate(device, completed)) \
-                                .add_done_callback(_log_task_exception)
+                    # Never fed to wake_capture: this is private-session audio,
+                    # already past the user's own wake word, and its pre-roll
+                    # would otherwise hold whatever a PRIOR session last said
+                    # (#696 review) — this frame type carries nothing else.
                     for chunk in device.listen_router.frame(
                             session, pcm, asyncio.get_event_loop().time()):
                         _put_voice_frame(device, chunk)

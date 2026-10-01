@@ -196,6 +196,12 @@ function uptime(s) {
   return `${m}m`;
 }
 
+// A health level from the controller (ok / warn / error) as a row colour.
+function _levelColor(level) {
+  return level === 'error' ? 'var(--error)' : level === 'warn' ? 'var(--warn)'
+       : level === 'ok' ? 'var(--ok)' : undefined;
+}
+
 function relTime(ts) {
   if (!ts) return '—';
   const d = Date.now() - ts * 1000;
@@ -2178,6 +2184,18 @@ function Detail({ device, token, onClose, onApprove, isAdmin, globalConfig, onDe
                              : '—',
                          device.connected ? (device.linkTls ? 'var(--ok)' : 'var(--warn)')
                            : device.linkRefused ? 'var(--error)' : undefined)}
+                    {/* The eMMC's own wear report and how the current boot
+                        started (schema v28). A watchdog or panic boot is the
+                        sign of a hang nobody saw. Both are absent on firmware
+                        that does not report them, and say so. */}
+                    {row('Flash wear', device.health?.emmc
+                           ? <span title={device.health.emmcPart || undefined}>{device.health.emmc.text}</span>
+                           : '—',
+                         _levelColor(device.health?.emmc?.level))}
+                    {row('Last boot', device.health?.bootAt
+                           ? [device.health.bootReason?.text, relTime(device.health.bootAt)].filter(Boolean).join(' · ')
+                           : '—',
+                         _levelColor(device.health?.bootReason?.level))}
                     {row('Config', (() => {
                       const n = (device.config_sections ?? []).length;
                       const total = Object.keys(CONFIG_SECTIONS).length;
@@ -2374,6 +2392,10 @@ function Detail({ device, token, onClose, onApprove, isAdmin, globalConfig, onDe
                 localCapable={!device.connected || !!device.owwLocalCapable}
                 listen={device.connected ? device.listen : null}
                 wakeCueCapable={!device.connected || !!device.wakeCueCapable}
+                sendspinCapable={!device.connected || !!device.sendspinCapable}
+                sendspinPanel={device.connected && device.sendspinCapable
+                  ? <SendspinPairing deviceId={device.device_id} status={device.sendspin} isAdmin={isAdmin}/>
+                  : null}
                 mixCapable={!device.connected || !!device.audioMixCapable}
                 holdCapable={!device.connected || !!device.buttonHoldCapable}
                 hwEchoRef={device.connected && device.aecRef === 'hw'}
@@ -2797,12 +2819,19 @@ function Card({ device, onClick }) {
         <LedRing state={state} size={120}/>
       </div>
       <div style={{ padding: '0 16px 16px' }}>
-        <div className="em-inset" style={{ '--em-inset-radius':'6px', '--em-inset-pad':'7px 12px', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-          <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 11, color: state.lcd, letterSpacing: '0.12em', textShadow: `0 0 8px ${state.dot}88` }}>{state.label.toUpperCase()}</span>
-          <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 9, color: 'var(--lcd-dim)', letterSpacing: '0.08em' }}>{(() => {
+        {/* At the 190px minimum card width a long state (OFFLINE, LISTENING)
+            and a full IP do not fit on one line, and wrapping only when they
+            collide left cards in one row with footers of different heights.
+            So the IP always has its own line. */}
+        <div className="em-inset" style={{ '--em-inset-radius':'6px', '--em-inset-pad':'7px 12px', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 3 }}>
+          <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 11, color: state.lcd, letterSpacing: '0.12em', textShadow: `0 0 8px ${state.dot}88`, whiteSpace: 'nowrap' }}>{state.label.toUpperCase()}</span>
+          {(() => {
             const ip = device.ip && device.ip !== '127.0.0.1' ? device.ip : null;
-            return device.connected ? (ip || '—') : (ip ? `${ip} ↑` : '—');
-          })()}</span>
+            return (
+              <span title={!device.connected && ip ? 'Last known address' : undefined}
+                    style={{ fontFamily: "'DM Mono',monospace", fontSize: 9, color: 'var(--lcd-dim)', letterSpacing: '0.08em', whiteSpace: 'nowrap' }}>{ip || '—'}</span>
+            );
+          })()}
         </div>
       </div>
     </div>
@@ -8984,14 +9013,15 @@ const CONFIG_SECTIONS = {
   "microphones": ["adcMicpga", "adcDigitalGain", "micGainDb", "beamformingEnabled", "beamAngle", "aecEnabled", "aecDelayMs", "aecTailMs", "aecRefSource", "nsAsr", "saveUtterances"],
   "ring": ["ledScene", "ledListenColor", "ledThinkColor", "meterAttack", "meterDecay", "meterFloor", "meterGamma", "meterRef", "meterCurve"],
   "advanced": ["agcEnabled", "vadThreshold", "vadSpeechMs", "vadSilenceMs", "buttonSingleTapEvent", "buttonMultiTapMs", "consolePassword", "consoleTimeoutMin", "controllerEndpoints"],
-  "bluetooth": ["bleProxyEnabled"]
+  "bluetooth": ["bleProxyEnabled"],
+  "sendspin": ["sendspinEnabled", "sendspinUnpaired"]
 };
 
 // Display labels for the section ids, and the reverse key -> section index
 // that lets a write be gated by the section owning the key it touches.
 const SECTION_LABELS = {
   playback: 'Playback', wakeword: 'Wake word', microphones: 'Microphones',
-  ring: 'Ring', advanced: 'Advanced', bluetooth: 'Bluetooth',
+  ring: 'Ring', advanced: 'Advanced', bluetooth: 'Bluetooth', sendspin: 'Sendspin',
 };
 const KEY_SECTION = {};
 Object.entries(CONFIG_SECTIONS).forEach(([sid, keys]) => {
@@ -9139,7 +9169,8 @@ function DeviceConfigForm({ config, onChange, disabled, sections, onScopeChange,
                             holdCapable = true, triggerCapable = true,
                             localCapable = true, listen = null,
                             hwEchoRef = false, hwRefCapable = true,
-                            emosFleet = true, wakeCueCapable = true }) {
+                            emosFleet = true, wakeCueCapable = true,
+                            sendspinCapable = true, sendspinPanel = null }) {
   // emosFleet defaults TRUE for the same reason the capability props above do,
   // and for one more: it gates the console password, which is emOS-only, and
   // disabling a setting because we do not KNOW the fleet has an emOS device
@@ -9501,8 +9532,15 @@ function DeviceConfigForm({ config, onChange, disabled, sections, onScopeChange,
                 <span style={{ fontFamily: mono, fontSize: 9, color: 'var(--muted)' }}>Eager</span>
               </div>
               <Slider label="Arbitration window" sub="ms that the first Echo to hear you silences the others — no added delay; 0 disables" value={config.wakeArbitrationMs ?? 700} min={0} max={2000} step={50} unit="ms" onChange={v => set('wakeArbitrationMs', v)}/>
-              <Toggle label="Save wake-word samples" sub="saves clips for review in Activity" value={config.wakeClipCapture ?? false} onChange={v => set('wakeClipCapture', v)}/>
-              <Slider label="Minimum sample score" sub="lower catches more near-misses, but more ordinary speech too" value={config.wakeClipMinScore ?? 0.20} min={0.05} max={0.95} step={0.01} formatValue={v => v.toFixed(2)} onChange={v => set('wakeClipMinScore', v)}/>
+              <Toggle label="Save wake-word samples"
+                sub={onDeviceMode(config) === 'off'
+                  ? 'saves clips for review in Activity'
+                  : "only works with wake word detection On the controller"}
+                disabled={onDeviceMode(config) !== 'off'}
+                value={config.wakeClipCapture ?? false} onChange={v => set('wakeClipCapture', v)}/>
+              <Slider label="Minimum sample score" sub="lower catches more near-misses, but more ordinary speech too"
+                disabled={onDeviceMode(config) !== 'off'}
+                value={config.wakeClipMinScore ?? 0.20} min={0.05} max={0.95} step={0.01} formatValue={v => v.toFixed(2)} onChange={v => set('wakeClipMinScore', v)}/>
               {/* Accessibility first: the ring is the only other sign the Echo
                   is listening. Disabled with the reason on firmware that cannot
                   play it, never a switch that saves and stays silent. */}
@@ -9794,6 +9832,86 @@ function DeviceConfigForm({ config, onChange, disabled, sections, onScopeChange,
           <Toggle label="Bluetooth proxy" sub="passive BLE scan → HA (Bermuda, BLE sensors)" value={config.bleProxyEnabled ?? false} onChange={v => set('bleProxyEnabled', v)}/>
         </div>
       </Stage>
+
+      {/* 07 SENDSPIN */}
+      <Stage n="07" title="Sendspin"
+        chips={<ScopeChip tone="device">Device</ScopeChip>}
+        desc="Makes the Echo a Sendspin player, so Music Assistant can group it with other speakers and play to all of them in sync. Music Assistant connects to the Echo directly. Music from Home Assistant still takes priority and leaves the group. Early Access."
+        scope={scopeEl('sendspin')} dim={secStyle('sendspin')}>
+        <div className="em-grid2" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0 24px', ...inputStyle }}>
+          <Toggle label="Sendspin player"
+            sub={sendspinCapable ? 'Music Assistant finds it on the network' : 'needs newer firmware on this Echo'}
+            disabled={!sendspinCapable}
+            value={config.sendspinEnabled ?? false}
+            onChange={v => set('sendspinEnabled', v)}/>
+          <Toggle label="Play without pairing"
+            sub="any server Music Assistant approves; less secure"
+            disabled={!sendspinCapable || !(config.sendspinEnabled ?? false)}
+            value={config.sendspinUnpaired ?? false}
+            onChange={v => set('sendspinUnpaired', v)}/>
+        </div>
+        {(config.sendspinEnabled ?? false) && sendspinPanel}
+      </Stage>
+    </div>
+  );
+}
+
+// SendspinPairing: one Echo's player status, and the pairing token to paste
+// into Music Assistant (Settings → Players → the Echo → Pair with token). The
+// token is fetched from the Echo on request and never kept: it carries the
+// Echo's pairing key.
+function SendspinPairing({ deviceId, status, isAdmin }) {
+  const mono = "'DM Mono',monospace";
+  const [token, setToken] = useState(null);
+  const [error, setError] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [copied, setCopied] = useState(false);
+
+  const show = async () => {
+    setBusy(true); setError('');
+    try {
+      const r = await API.get(`/api/devices/${deviceId}/sendspin/token`);
+      setToken(r.token);
+    } catch (e) {
+      setError(e.error || e.message || 'Could not get the token');
+    } finally {
+      setBusy(false);
+    }
+  };
+  const copy = () => {
+    navigator.clipboard.writeText(token).then(() => setCopied(true)).catch(() => {});
+  };
+
+  let line = 'Starting';
+  if (status) {
+    switch (status.state) {
+      case 'listening': line = 'Waiting for Music Assistant'; break;
+      case 'connected': line = `Connected to ${status.server}`; break;
+      case 'playing':   line = status.group ? `Playing in ${status.group}` : 'Playing'; break;
+      case 'busy':      line = 'Home Assistant is playing, so it left its group'; break;
+      case 'error':     line = `Not running: ${status.error}`; break;
+      default:          line = status.state || 'Starting';
+    }
+    if ((status.state === 'connected' || status.state === 'playing') && !status.paired) line += ' · unpaired';
+  }
+  const paired = status && status.pairedWith > 0
+    ? `paired with ${status.pairedWith} server${status.pairedWith === 1 ? '' : 's'}` : 'not paired';
+
+  return (
+    <div style={{ fontFamily: mono, fontSize: 11, color: 'var(--text2)', display: 'flex', flexDirection: 'column', gap: 8 }}>
+      <div>{line} <span style={{ color: 'var(--muted)' }}>· {paired}</span></div>
+      {isAdmin && !token && (
+        <div><Pill small disabled={busy} onClick={show}>{busy ? 'Asking the Echo…' : 'Show pairing token'}</Pill></div>
+      )}
+      {token && (
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap', minWidth: 0 }}>
+          <span style={{ wordBreak: 'break-all', userSelect: 'all' }}>{token}</span>
+          <Pill small onClick={copy}>{copied ? 'Copied' : 'Copy'}</Pill>
+          <Pill small onClick={() => { setToken(null); setCopied(false); }}>Hide</Pill>
+        </div>
+      )}
+      {token && <div style={{ color: 'var(--muted)', fontSize: 10 }}>In Music Assistant, pair this player with the token. Anyone with it can pair with this Echo.</div>}
+      {error && <div style={{ color: 'var(--error)' }}>{error}</div>}
     </div>
   );
 }
